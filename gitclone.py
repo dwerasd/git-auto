@@ -194,12 +194,10 @@ def get_unique_path(base_path: str, repo_name: str, owner: str) -> str:
     """
     중복되지 않는 클론 경로 생성
     
-    1. base_path/repo_name (기본)
-    2. base_path/repo_name_owner (중복 시)
-    3. base_path/repo_name_owner_2 (그래도 중복 시)
+    새 구조: base_path/owner/repo_name
     """
-    # 기본 경로 시도
-    target_path = os.path.join(base_path, repo_name)
+    # 기본 경로: base_path/owner/repo_name
+    target_path = os.path.join(base_path, owner, repo_name)
     if not os.path.exists(target_path):
         return target_path
     
@@ -209,15 +207,10 @@ def get_unique_path(base_path: str, repo_name: str, owner: str) -> str:
         # 같은 저장소면 그대로 사용
         return target_path
     
-    # owner 이름 추가
-    target_path = os.path.join(base_path, f"{repo_name}_{owner}")
-    if not os.path.exists(target_path):
-        return target_path
-    
-    # 숫자 추가
+    # 중복 시 숫자 추가: base_path/owner/repo_name_2, repo_name_3, ...
     counter = 2
     while True:
-        target_path = os.path.join(base_path, f"{repo_name}_{owner}_{counter}")
+        target_path = os.path.join(base_path, owner, f"{repo_name}_{counter}")
         if not os.path.exists(target_path):
             return target_path
         counter += 1
