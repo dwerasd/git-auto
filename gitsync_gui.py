@@ -196,11 +196,21 @@ class GitSyncGUI:
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
         
+        # 드래그 앤 드롭 관련 변수
+        self.drag_item = None
+        self.drag_start_y = 0
+        
         # 트리뷰 이벤트 바인딩
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         self.tree.bind("<Button-3>", self.on_tree_right_click)
         self.tree.bind("<Button-1>", self.on_tree_click)
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_button_release)
+        self.tree.bind("<B1-Motion>", self.on_tree_drag_motion)
         self.tree.bind("<space>", self.on_tree_space)
+        self.tree.bind("<F5>", self.on_refresh_key)
+        
+        # 루트 윈도우에도 F5 바인딩 (어디서든 작동하도록)
+        self.root.bind("<F5>", self.on_refresh_key)
         
         # 행 색상 태그 설정
         self.tree.tag_configure("error", background="#ffcccc")  # 연한 빨간색
@@ -208,10 +218,12 @@ class GitSyncGUI:
         
         # 컨텍스트 메뉴 생성
         self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="🔄 업데이트", command=self.menu_check_and_update)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="📁 폴더 열기", command=self.menu_open_folder)
         self.context_menu.add_command(label="🌐 저장소 열기", command=self.menu_open_repo)
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="⬇️ 업데이트", command=self.menu_update)
+        self.context_menu.add_command(label="⬇️ 강제 업데이트", command=self.menu_update)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="🗑️ 삭제", command=self.menu_delete)
         
@@ -268,7 +280,10 @@ class GitSyncGUI:
         repos_data = load_repos()
         self.subscriptions = repos_data.get("subscriptions", [])
         
-        for sub in self.subscriptions:
+        # 자동업데이트 상태에 따라 정렬: 체크된 항목 먼저, 그 다음 체크 안 된 항목
+        sorted_subs = sorted(self.subscriptions, key=lambda x: (not x.get("auto_update", True), self.subscriptions.index(x)))
+        
+        for sub in sorted_subs:
             repo = sub.get("repo", "")
             branch = sub.get("branch", "main")
             local_path = sub.get("local_path", "")
@@ -347,30 +362,158 @@ class GitSyncGUI:
             for repo in selection:
                 self._toggle_auto_update(repo)
     
+    def on_refresh_key(self, event):
+        """F5 키 - 전체 리스트 갱신"""
+        if not self.is_running:
+            self.append_log("\n🔄 F5 - 리스트 갱신 중...\n", "info")
+            self.refresh_list()
+            self.append_log("✅ 리스트 갱신 완료\n\n", "info")
+    
+    def on_tree_button_release(self, event):
+        """마우스 버튼 릴리즈 - 드래그 앤 드롭 완료"""
+        if self.drag_item:
+            # 드롭 위치 확인
+            drop_target = self.tree.identify_row(event.y)
+            
+            if drop_target and drop_target != self.drag_item:
+                # 드래그한 항목과 드롭 위치가 다른 경우 순서 변경
+                self._reorder_items(self.drag_item, drop_target)
+            
+            # 드래그 상태 초기화
+            self.drag_item = None
+            self.drag_start_y = 0
+    
+    def on_tree_drag_motion(self, event):
+        """마우스 드래그 중"""
+        if not self.drag_item:
+            # 드래그 시작
+            item = self.tree.identify_row(event.y)
+            if item:
+                self.drag_item = item
+                self.drag_start_y = event.y
+        else:
+            # 드래그 중 - 시각적 피드백을 위해 선택 유지
+            drop_target = self.tree.identify_row(event.y)
+            if drop_target:
+                self.tree.selection_set(drop_target)
+    
+    def _reorder_items(self, source_item: str, target_item: str):
+        """트리뷰와 JSON에서 항목 순서 변경 (같은 그룹 내에서만)"""
+        try:
+            # 소스와 타겟의 auto_update 상태 확인
+            source_sub = next((s for s in self.subscriptions if s.get("repo") == source_item), None)
+            target_sub = next((s for s in self.subscriptions if s.get("repo") == target_item), None)
+            
+            if not source_sub or not target_sub:
+                return
+            
+            source_auto = source_sub.get("auto_update", True)
+            target_auto = target_sub.get("auto_update", True)
+            
+            # 같은 그룹(체크/미체크)이 아니면 이동 불가
+            if source_auto != target_auto:
+                self.append_log(f"⚠️ 같은 그룹 내에서만 순서를 변경할 수 있습니다\n", "warning")
+                return
+            
+            # 현재 모든 항목의 순서 가져오기
+            all_items = self.tree.get_children()
+            items_list = list(all_items)
+            
+            # 소스와 타겟의 인덱스 찾기
+            source_idx = items_list.index(source_item)
+            target_idx = items_list.index(target_item)
+            
+            # 리스트에서 순서 변경
+            items_list.insert(target_idx, items_list.pop(source_idx))
+            
+            # 트리뷰 순서 재정렬
+            for idx, item in enumerate(items_list):
+                self.tree.move(item, "", idx)
+            
+            # subscriptions 순서도 변경 (같은 순서로 재정렬)
+            new_subscriptions = []
+            for item in items_list:
+                sub = next((s for s in self.subscriptions if s.get("repo") == item), None)
+                if sub:
+                    new_subscriptions.append(sub)
+            
+            self.subscriptions = new_subscriptions
+            
+            # repos.json에 저장
+            repos_data = load_repos()
+            repos_data["subscriptions"] = self.subscriptions
+            save_repos(repos_data)
+            
+            self.append_log(f"📋 '{source_item}' 위치를 '{target_item}' 위치로 이동\n", "info")
+        
+        except Exception as e:
+            self.append_log(f"❌ 순서 변경 실패: {str(e)}\n", "error")
+    
     def _toggle_auto_update(self, repo: str):
-        """자동업데이트 토글"""
+        """자동업데이트 토글 및 위치 이동"""
         # subscriptions에서 찾아서 토글
-        for sub in self.subscriptions:
+        for idx, sub in enumerate(self.subscriptions):
             if sub.get("repo") == repo:
                 current = sub.get("auto_update", False)
-                sub["auto_update"] = not current
+                new_state = not current
+                sub["auto_update"] = new_state
+                
+                # subscriptions에서 제거
+                removed_sub = self.subscriptions.pop(idx)
+                
+                # 새 위치 결정
+                if new_state:
+                    # 체크 활성화: 체크된 항목들의 맨 아래로 이동
+                    # 체크된 항목들 중 마지막 인덱스 찾기
+                    last_checked_idx = -1
+                    for i, s in enumerate(self.subscriptions):
+                        if s.get("auto_update", True):
+                            last_checked_idx = i
+                    
+                    # 체크된 항목들의 바로 다음에 삽입
+                    insert_idx = last_checked_idx + 1
+                else:
+                    # 체크 해제: 맨 아래로 이동
+                    insert_idx = len(self.subscriptions)
+                
+                # 새 위치에 삽입
+                self.subscriptions.insert(insert_idx, removed_sub)
                 
                 # repos.json 저장
                 repos_data = load_repos()
-                for s in repos_data.get("subscriptions", []):
-                    if s.get("repo") == repo:
-                        s["auto_update"] = not current
-                        break
+                repos_data["subscriptions"] = self.subscriptions
                 save_repos(repos_data)
                 
-                # 트리뷰 업데이트
-                values = list(self.tree.item(repo, "values"))
-                values[5] = "✓" if not current else ""  # 여섯 번째 컬럼 (인덱스 5)
-                self.tree.item(repo, values=values)
+                # 트리뷰 전체 갱신 (순서가 변경되므로)
+                self._refresh_tree_order()
                 
-                status = "활성화" if not current else "비활성화"
-                self.append_log(f"🔄 {repo} 자동업데이트 {status}\n", "info")
+                status = "활성화" if new_state else "비활성화"
+                position = "체크된 항목들의 맨 아래" if new_state else "맨 아래"
+                self.append_log(f"🔄 {repo} 자동업데이트 {status} → {position}로 이동\n", "info")
                 break
+    
+    def _refresh_tree_order(self):
+        """트리뷰 순서를 subscriptions 순서에 맞게 갱신"""
+        # 현재 트리의 모든 항목 상태 저장
+        tree_data = {}
+        for item in self.tree.get_children():
+            values = self.tree.item(item, "values")
+            tags = self.tree.item(item, "tags")
+            tree_data[item] = {"values": values, "tags": tags}
+        
+        # 트리 클리어
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # subscriptions 순서대로 다시 삽입
+        for sub in self.subscriptions:
+            repo = sub.get("repo", "")
+            if repo in tree_data:
+                data = tree_data[repo]
+                # auto_update 컬럼 업데이트
+                values = list(data["values"])
+                values[5] = "✓" if sub.get("auto_update", True) else ""
+                self.tree.insert("", tk.END, iid=repo, values=tuple(values), tags=data["tags"])
     
     def _get_selected_repo(self) -> dict | None:
         """현재 선택된 저장소 정보 반환"""
@@ -397,25 +540,144 @@ class GitSyncGUI:
         if item:
             self.tree.selection_set(item)
             
-            # 업데이트 메뉴 활성화/비활성화 결정
+            # 저장소 정보 확인
             repo = item
+            sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
+            
+            # 업데이트 체크 및 실행 - 폴더가 있고 작업 중이 아닐 때만 활성화
+            if sub and os.path.exists(sub.get("local_path", "")) and not self.is_running:
+                self.context_menu.entryconfig("🔄 업데이트 체크 및 실행", state=tk.NORMAL)
+            else:
+                self.context_menu.entryconfig("🔄 업데이트 체크 및 실행", state=tk.DISABLED)
+            
+            # 강제 업데이트 메뉴 활성화/비활성화 결정
             result = self.check_results.get(repo, {})
             status = result.get("status", "")
             
             # 업데이트 가능한 경우에만 활성화
             if status == "update-available":
-                self.context_menu.entryconfig("⬇️ 업데이트", state=tk.NORMAL)
+                self.context_menu.entryconfig("⬇️ 강제 업데이트", state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig("⬇️ 업데이트", state=tk.DISABLED)
+                self.context_menu.entryconfig("⬇️ 강제 업데이트", state=tk.DISABLED)
             
             # 폴더 열기 메뉴 - 폴더가 없으면 비활성화
-            sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
             if sub and os.path.exists(sub.get("local_path", "")):
                 self.context_menu.entryconfig("📁 폴더 열기", state=tk.NORMAL)
             else:
                 self.context_menu.entryconfig("📁 폴더 열기", state=tk.DISABLED)
             
             self.context_menu.post(event.x_root, event.y_root)
+    
+    def menu_check_and_update(self):
+        """컨텍스트 메뉴: 선택한 저장소의 업데이트 확인 후 필요시 업데이트"""
+        sub = self._get_selected_repo()
+        if not sub or self.is_running:
+            return
+        
+        repo = sub.get("repo", "")
+        thread = threading.Thread(target=self._check_and_update_single_thread, args=(repo,), daemon=True)
+        thread.start()
+    
+    def _check_and_update_single_thread(self, repo: str):
+        """단일 저장소 업데이트 확인 및 업데이트 스레드"""
+        self.root.after(0, lambda: self.set_running(True, f"{repo} 확인 중..."))
+        
+        sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
+        if not sub:
+            self.root.after(0, lambda: self.append_log(f"❌ {repo} 정보를 찾을 수 없음\n"))
+            self.root.after(0, lambda: self.set_running(False))
+            return
+        
+        local_path = sub.get("local_path", "")
+        branch = sub.get("branch", "main")
+        token = self.env_config.get("GITHUB_TOKEN", "")
+        
+        self.root.after(0, lambda: self.append_log(f"\n🔍 {repo} 업데이트 확인 중...\n"))
+        
+        # 1. 폴더 존재 확인
+        if not os.path.exists(local_path):
+            self.root.after(0, lambda: self.append_log(f"  ❌ 로컬 폴더 없음: {local_path}\n"))
+            self.root.after(0, lambda: self.set_running(False))
+            return
+        
+        if not os.path.exists(os.path.join(local_path, ".git")):
+            self.root.after(0, lambda: self.append_log(f"  ❌ Git 저장소 아님\n"))
+            self.root.after(0, lambda: self.set_running(False))
+            return
+        
+        # 2. Fetch
+        self.root.after(0, lambda: self.append_log(f"  📡 원격 정보 가져오는 중...\n"))
+        
+        if token:
+            owner, repo_name = repo.split("/")
+            token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
+            run_git(["remote", "set-url", "origin", token_url], local_path)
+        
+        success, output = run_git(["fetch", "origin"], local_path)
+        
+        if token:
+            owner, repo_name = repo.split("/")
+            clean_url = f"https://github.com/{owner}/{repo_name}.git"
+            run_git(["remote", "set-url", "origin", clean_url], local_path)
+        
+        if not success:
+            self.root.after(0, lambda: self.append_log(f"  ❌ fetch 실패: {output}\n"))
+            self.root.after(0, lambda: self.set_running(False))
+            return
+        
+        # 3. 커밋 비교
+        local_commit = get_local_commit(local_path)
+        remote_commit = get_remote_commit(local_path, branch)
+        
+        if not local_commit or not remote_commit:
+            self.root.after(0, lambda: self.append_log(f"  ❌ 커밋 정보 확인 실패\n"))
+            self.root.after(0, lambda: self.set_running(False))
+            return
+        
+        # 4. 최신 버전 체크
+        if local_commit == remote_commit:
+            self.root.after(0, lambda: self.append_log(f"  ✅ 이미 최신 버전입니다\n"))
+            self.root.after(0, lambda: self.append_log(f"  커밋: {local_commit[:7]}\n\n"))
+            self.root.after(0, lambda: self.set_running(False))
+            return
+        
+        # 5. 업데이트 실행
+        self.root.after(0, lambda: self.append_log(f"  🔄 업데이트 필요: {local_commit[:7]} → {remote_commit[:7]}\n"))
+        self.root.after(0, lambda: self.append_log(f"  ⬇️ 업데이트 중...\n"))
+        
+        if token:
+            owner, repo_name = repo.split("/")
+            token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
+            run_git(["remote", "set-url", "origin", token_url], local_path)
+        
+        success, output = run_git(["pull", "origin", branch], local_path)
+        
+        if token:
+            owner, repo_name = repo.split("/")
+            clean_url = f"https://github.com/{owner}/{repo_name}.git"
+            run_git(["remote", "set-url", "origin", clean_url], local_path)
+        
+        if success:
+            # 커밋 SHA 업데이트
+            new_commit = get_local_commit(local_path)
+            if new_commit:
+                repos_data = load_repos()
+                for s in repos_data.get("subscriptions", []):
+                    if s.get("repo") == repo:
+                        s["last_commit"] = new_commit
+                        break
+                save_repos(repos_data)
+            
+            self.root.after(0, lambda: self.append_log(f"  ✅ 업데이트 완료!\n"))
+            self.root.after(0, lambda: self.append_log(f"  새 커밋: {remote_commit[:7]}\n\n"))
+            
+            # 트리뷰 업데이트
+            self.root.after(0, lambda: self.tree.set(repo, "update", f"✅ {local_commit[:7]} → {remote_commit[:7]}"))
+        else:
+            self.root.after(0, lambda: self.append_log(f"  ❌ 업데이트 실패: {output}\n\n"))
+            self.root.after(0, lambda: self.tree.set(repo, "update", "❌ 업데이트 실패"))
+        
+        self.root.after(0, lambda: self.set_running(False))
     
     def menu_open_folder(self):
         """컨텍스트 메뉴: 폴더 열기"""
@@ -574,11 +836,21 @@ class GitSyncGUI:
         token = self.env_config.get("GITHUB_TOKEN", "")
         
         update_count = 0
+        skipped_count = 0
         
         for sub in self.subscriptions:
             repo = sub.get("repo", "")
             local_path = sub.get("local_path", "")
             branch = sub.get("branch", "main")
+            auto_update = sub.get("auto_update", True)  # 기본값 True
+            
+            # 자동업데이트가 체크되지 않은 경우 건너뛰기
+            if not auto_update:
+                self.root.after(0, lambda r=repo: self.append_log(f"⏭️ {r} 건너뜀 (자동업데이트 꺼짐)\n", "info"))
+                self.check_results[repo] = {"status": "skipped", "message": "자동업데이트 꺼짐"}
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⏭️", "자동업데이트 꺼짐"))
+                skipped_count += 1
+                continue
             
             self.root.after(0, lambda r=repo: self.append_log(f"🔍 {r} 확인 중...\n"))
             
@@ -635,7 +907,12 @@ class GitSyncGUI:
                 self.root.after(0, lambda r=repo, m=msg: self._update_tree_item(r, "🔄", m))
                 self.root.after(0, lambda r=repo: self.append_log(f"  ↳ 업데이트 가능\n", "warning"))
         
-        self.root.after(0, lambda: self.append_log(f"\n✅ 확인 완료: {update_count}개 업데이트 가능\n", "success"))
+        msg = f"\n✅ 확인 완료: {update_count}개 업데이트 가능"
+        if skipped_count > 0:
+            msg += f", {skipped_count}개 건너뜀\n"
+        else:
+            msg += "\n"
+        self.root.after(0, lambda: self.append_log(msg, "success"))
         self.root.after(0, lambda: self.set_running(False))
     
     def _update_tree_item(self, repo: str, status: str, update_info: str, is_error: bool = False):
