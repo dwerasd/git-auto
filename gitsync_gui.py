@@ -212,6 +212,8 @@ class GitSyncGUI:
         self.context_menu.add_command(label="🌐 저장소 열기", command=self.menu_open_repo)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="⬇️ 업데이트", command=self.menu_update)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="🗑️ 삭제", command=self.menu_delete)
         
         # 출력 영역
         output_frame = ttk.LabelFrame(main_frame, text="로그", padding="5")
@@ -441,6 +443,120 @@ class GitSyncGUI:
             repo = sub.get("repo", "")
             thread = threading.Thread(target=self._sync_thread, args=([repo],), daemon=True)
             thread.start()
+    
+    def menu_delete(self):
+        """컨텍스트 메뉴: 선택한 저장소 삭제 (로컬 폴더 + JSON)"""
+        sub = self._get_selected_repo()
+        if not sub:
+            return
+        
+        repo = sub.get("repo", "")
+        local_path = sub.get("local_path", "")
+        
+        # 확인 대화상자
+        result = messagebox.askyesno(
+            "저장소 삭제 확인",
+            f"다음 저장소를 삭제하시겠습니까?\n\n"
+            f"저장소: {repo}\n"
+            f"경로: {local_path}\n\n"
+            f"⚠️ 경고: 로컬 폴더와 구독 정보가 모두 삭제됩니다!\n"
+            f"이 작업은 되돌릴 수 없습니다.",
+            icon='warning'
+        )
+        
+        if not result:
+            return
+        
+        self.append_log(f"\n🗑️ {repo} 삭제 중...\n")
+        
+        # 1. 로컬 폴더 삭제
+        deleted_folder = False
+        if os.path.exists(local_path):
+            try:
+                import shutil
+                import stat
+                
+                self.append_log(f"  📁 로컬 폴더 삭제 중: {local_path}\n")
+                
+                # Windows에서 읽기 전용 파일 처리를 위한 오류 핸들러
+                def remove_readonly(func, path, excinfo):
+                    """읽기 전용 속성 제거 후 다시 시도"""
+                    try:
+                        os.chmod(path, stat.S_IWRITE)
+                        func(path)
+                    except Exception as e:
+                        self.append_log(f"    ⚠️ 파일 삭제 실패: {path} - {e}\n")
+                
+                # shutil.rmtree with error handler
+                shutil.rmtree(local_path, onerror=remove_readonly)
+                self.append_log(f"  ✅ 로컬 폴더 삭제 완료\n")
+                deleted_folder = True
+            except PermissionError as e:
+                # 권한 문제 발생 시 대체 방법 시도
+                self.append_log(f"  ⚠️ 권한 오류 발생, 대체 방법 시도 중...\n")
+                try:
+                    # Windows의 rmdir /s /q 명령 사용
+                    result = subprocess.run(
+                        ["cmd", "/c", "rmdir", "/s", "/q", local_path],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        self.append_log(f"  ✅ 로컬 폴더 삭제 완료 (대체 방법)\n")
+                        deleted_folder = True
+                    else:
+                        raise Exception(f"rmdir 실패: {result.stderr}")
+                except Exception as e2:
+                    self.append_log(f"  ❌ 대체 방법도 실패: {e2}\n")
+                    messagebox.showerror(
+                        "삭제 실패",
+                        f"로컬 폴더 삭제 실패:\n{e}\n\n"
+                        f"가능한 원인:\n"
+                        f"1. 폴더나 파일이 다른 프로그램에서 사용 중\n"
+                        f"2. 탐색기에서 해당 폴더를 열어둠\n"
+                        f"3. 바이러스 백신이나 인덱싱 서비스가 파일 접근 중\n\n"
+                        f"해결 방법:\n"
+                        f"- 관련 프로그램을 모두 닫고 다시 시도\n"
+                        f"- 탐색기를 닫고 다시 시도\n"
+                        f"- 수동으로 폴더 삭제: {local_path}"
+                    )
+                    return
+            except Exception as e:
+                self.append_log(f"  ❌ 로컬 폴더 삭제 실패: {e}\n")
+                messagebox.showerror("오류", f"로컬 폴더 삭제 실패:\n{e}")
+                return
+        else:
+            self.append_log(f"  ⚠️ 로컬 폴더가 존재하지 않음\n")
+        
+        # 2. repos.json에서 제거
+        try:
+            repos_data = load_repos()
+            original_count = len(repos_data.get("subscriptions", []))
+            
+            repos_data["subscriptions"] = [
+                s for s in repos_data.get("subscriptions", [])
+                if s.get("repo") != repo
+            ]
+            
+            if len(repos_data["subscriptions"]) < original_count:
+                save_repos(repos_data)
+                self.append_log(f"  ✅ 구독 정보 삭제 완료\n")
+            else:
+                self.append_log(f"  ⚠️ 구독 정보를 찾을 수 없음\n")
+            
+            self.append_log(f"✅ {repo} 삭제 완료!\n\n")
+            
+            # 3. 목록 새로고침
+            self.refresh_list()
+            
+            messagebox.showinfo(
+                "삭제 완료",
+                f"저장소가 삭제되었습니다:\n{repo}"
+            )
+            
+        except Exception as e:
+            self.append_log(f"  ❌ 구독 정보 삭제 실패: {e}\n")
+            messagebox.showerror("오류", f"구독 정보 삭제 실패:\n{e}")
     
     def check_updates(self):
         """업데이트 확인 (fetch + 비교)"""
