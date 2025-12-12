@@ -218,14 +218,14 @@ class GitSyncGUI:
         
         # 컨텍스트 메뉴 생성
         self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="🔄 업데이트", command=self.menu_check_and_update)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="📁 폴더 열기", command=self.menu_open_folder)
-        self.context_menu.add_command(label="🌐 저장소 열기", command=self.menu_open_repo)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="⬇️ 강제 업데이트", command=self.menu_update)
-        self.context_menu.add_separator()
-        self.context_menu.add_command(label="🗑️ 삭제", command=self.menu_delete)
+        self.context_menu.add_command(label="업데이트", command=self.menu_check_and_update)      # index 0
+        self.context_menu.add_separator()                                                          # index 1
+        self.context_menu.add_command(label="폴더 열기", command=self.menu_open_folder)           # index 2
+        self.context_menu.add_command(label="저장소 열기", command=self.menu_open_repo)           # index 3
+        self.context_menu.add_separator()                                                          # index 4
+        self.context_menu.add_command(label="강제 업데이트", command=self.menu_update)            # index 5
+        self.context_menu.add_separator()                                                          # index 6
+        self.context_menu.add_command(label="삭제", command=self.menu_delete)                     # index 7
         
         # 출력 영역
         output_frame = ttk.LabelFrame(main_frame, text="로그", padding="5")
@@ -544,27 +544,27 @@ class GitSyncGUI:
             repo = item
             sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
             
-            # 업데이트 체크 및 실행 - 폴더가 있고 작업 중이 아닐 때만 활성화
+            # 업데이트 체크 및 실행 (index 0) - 폴더가 있고 작업 중이 아닐 때만 활성화
             if sub and os.path.exists(sub.get("local_path", "")) and not self.is_running:
-                self.context_menu.entryconfig("🔄 업데이트 체크 및 실행", state=tk.NORMAL)
+                self.context_menu.entryconfig(0, state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig("🔄 업데이트 체크 및 실행", state=tk.DISABLED)
+                self.context_menu.entryconfig(0, state=tk.DISABLED)
             
-            # 강제 업데이트 메뉴 활성화/비활성화 결정
+            # 강제 업데이트 메뉴 (index 5) 활성화/비활성화 결정
             result = self.check_results.get(repo, {})
             status = result.get("status", "")
             
             # 업데이트 가능한 경우에만 활성화
             if status == "update-available":
-                self.context_menu.entryconfig("⬇️ 강제 업데이트", state=tk.NORMAL)
+                self.context_menu.entryconfig(5, state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig("⬇️ 강제 업데이트", state=tk.DISABLED)
+                self.context_menu.entryconfig(5, state=tk.DISABLED)
             
-            # 폴더 열기 메뉴 - 폴더가 없으면 비활성화
+            # 폴더 열기 메뉴 (index 2) - 폴더가 없으면 비활성화
             if sub and os.path.exists(sub.get("local_path", "")):
-                self.context_menu.entryconfig("📁 폴더 열기", state=tk.NORMAL)
+                self.context_menu.entryconfig(2, state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig("📁 폴더 열기", state=tk.DISABLED)
+                self.context_menu.entryconfig(2, state=tk.DISABLED)
             
             self.context_menu.post(event.x_root, event.y_root)
     
