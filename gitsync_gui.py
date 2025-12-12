@@ -72,6 +72,20 @@ def run_git(args: list[str], cwd: str | None = None) -> tuple[bool, str]:
         return False, str(e)
 
 
+def is_merge_conflict_error(git_output: str) -> bool:
+    """git 출력이 머지 충돌(미병합 파일)로 인한 실패인지 여부"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "unmerged" in text
+        or "unmerged files" in text
+        or "fix conflicts" in text
+        or "unresolved conflict" in text
+        or "you have unmerged paths" in text
+    )
+
+
 def get_local_commit(repo_path: str) -> str | None:
     """로컬 저장소의 현재 HEAD 커밋 SHA"""
     success, output = run_git(["rev-parse", "HEAD"], repo_path)
@@ -219,15 +233,16 @@ class GitSyncGUI:
         # 컨텍스트 메뉴 생성
         self.context_menu = tk.Menu(self.root, tearoff=0)
         self.context_menu.add_command(label="업데이트", command=self.menu_check_and_update)      # index 0
-        self.context_menu.add_separator()                                                          # index 1
-        self.context_menu.add_command(label="폴더 열기", command=self.menu_open_folder)           # index 2
-        self.context_menu.add_command(label="저장소 열기", command=self.menu_open_repo)           # index 3
-        self.context_menu.add_separator()                                                          # index 4
-        self.context_menu.add_command(label="강제 업데이트", command=self.menu_update)            # index 5
-        self.context_menu.add_separator()                                                          # index 6
-        self.context_menu.add_command(label="삭제", command=self.menu_delete)                     # index 7
+        self.context_menu.add_command(label="업데이트 확인", command=self.menu_check_selected_updates)  # index 1
+        self.context_menu.add_separator()                                                          # index 2
+        self.context_menu.add_command(label="폴더 열기", command=self.menu_open_folder)           # index 3
+        self.context_menu.add_command(label="저장소 열기", command=self.menu_open_repo)           # index 4
+        self.context_menu.add_separator()                                                          # index 5
+        self.context_menu.add_command(label="강제 업데이트", command=self.menu_update)            # index 6
+        self.context_menu.add_separator()                                                          # index 7
+        self.context_menu.add_command(label="삭제", command=self.menu_delete)                     # index 8
         
-        # 출력 영역
+    # 출력 영역
         output_frame = ttk.LabelFrame(main_frame, text="로그", padding="5")
         output_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -538,54 +553,181 @@ class GitSyncGUI:
         # 클릭한 위치의 항목 선택
         item = self.tree.identify_row(event.y)
         if item:
-            self.tree.selection_set(item)
+            # 여러개 선택된 상태에서 우클릭하면 selection을 유지해야 함.
+            # 단, 우클릭한 항목이 현재 selection에 없으면 해당 항목만 선택.
+            current_selection = set(self.tree.selection())
+            if item not in current_selection:
+                self.tree.selection_set(item)
             
             # 저장소 정보 확인
             repo = item
             sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
             
-            # 업데이트 체크 및 실행 (index 0) - 폴더가 있고 작업 중이 아닐 때만 활성화
-            if sub and os.path.exists(sub.get("local_path", "")) and not self.is_running:
-                self.context_menu.entryconfig(0, state=tk.NORMAL)
+            # 업데이트 (index 0) - 선택된 항목 중 로컬 폴더가 하나라도 있고, 작업 중이 아닐 때만 활성화
+            if not self.is_running:
+                selections = list(self.tree.selection())
+                has_any_local = False
+                for r in selections:
+                    s = next((x for x in self.subscriptions if x.get("repo") == r), None)
+                    if s and os.path.exists(s.get("local_path", "")):
+                        has_any_local = True
+                        break
+                self.context_menu.entryconfig(0, state=(tk.NORMAL if has_any_local else tk.DISABLED))
             else:
                 self.context_menu.entryconfig(0, state=tk.DISABLED)
+
+            # 업데이트 확인 (index 1) - 작업 중이 아닐 때만 활성화 (auto_update 꺼짐도 허용)
+            if not self.is_running:
+                self.context_menu.entryconfig(1, state=tk.NORMAL)
+            else:
+                self.context_menu.entryconfig(1, state=tk.DISABLED)
             
-            # 강제 업데이트 메뉴 (index 5) 활성화/비활성화 결정
+            # 강제 업데이트 메뉴 (index 6) 활성화/비활성화 결정
             result = self.check_results.get(repo, {})
             status = result.get("status", "")
             
             # 업데이트 가능한 경우에만 활성화
             if status == "update-available":
-                self.context_menu.entryconfig(5, state=tk.NORMAL)
+                self.context_menu.entryconfig(6, state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig(5, state=tk.DISABLED)
+                self.context_menu.entryconfig(6, state=tk.DISABLED)
             
-            # 폴더 열기 메뉴 (index 2) - 폴더가 없으면 비활성화
+            # 폴더 열기 메뉴 (index 3) - 폴더가 없으면 비활성화
             if sub and os.path.exists(sub.get("local_path", "")):
-                self.context_menu.entryconfig(2, state=tk.NORMAL)
+                self.context_menu.entryconfig(3, state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig(2, state=tk.DISABLED)
+                self.context_menu.entryconfig(3, state=tk.DISABLED)
             
             self.context_menu.post(event.x_root, event.y_root)
     
     def menu_check_and_update(self):
-        """컨텍스트 메뉴: 선택한 저장소의 업데이트 확인 후 필요시 업데이트"""
-        sub = self._get_selected_repo()
-        if not sub or self.is_running:
+        """컨텍스트 메뉴: 선택한(1개 또는 여러개) 저장소를 업데이트 확인 후 필요시 업데이트"""
+        if self.is_running:
             return
-        
-        repo = sub.get("repo", "")
-        thread = threading.Thread(target=self._check_and_update_single_thread, args=(repo,), daemon=True)
+
+        selection = list(self.tree.selection())
+        if not selection:
+            return
+
+        thread = threading.Thread(target=self._check_and_update_selected_thread, args=(selection,), daemon=True)
         thread.start()
+
+    def _check_and_update_selected_thread(self, repos: list[str]):
+        """선택 저장소들을 순차 업데이트(확인+필요시 pull)"""
+        self.root.after(0, lambda: self.set_running(True, f"업데이트 중... ({len(repos)}개)"))
+        self.root.after(0, lambda: self.append_log(f"\n⬇️ 선택 {len(repos)}개 저장소 업데이트 시작\n", "info"))
+
+        for repo in repos:
+            # 단일 업데이트 루틴을 재사용하되, running 상태는 바깥에서 관리
+            self._check_and_update_single_thread(repo, manage_running=False)
+
+        self.root.after(0, lambda: self.append_log("\n✅ 선택 업데이트 완료\n\n", "success"))
+        self.root.after(0, lambda: self.set_running(False))
+
+    def menu_check_selected_updates(self):
+        """컨텍스트 메뉴: 선택한(1개 또는 여러개) 저장소 업데이트 확인만 수행"""
+        if self.is_running:
+            return
+
+        selection = list(self.tree.selection())
+        if not selection:
+            return
+
+        thread = threading.Thread(target=self._check_selected_updates_thread, args=(selection,), daemon=True)
+        thread.start()
+
+    def _check_selected_updates_thread(self, repos: list[str]):
+        """선택 저장소들의 업데이트 확인 스레드 (auto_update=False도 강제 체크)"""
+        self.root.after(0, lambda: self.set_running(True, "업데이트 확인 중..."))
+        self.root.after(0, lambda: self.append_log(f"\n🔍 선택 {len(repos)}개 저장소 업데이트 확인\n", "info"))
+
+        token = self.env_config.get("GITHUB_TOKEN", "")
+        update_count = 0
+        error_count = 0
+
+        for repo in repos:
+            sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
+            if not sub:
+                error_count += 1
+                self.root.after(0, lambda r=repo: self.append_log(f"  ❌ {r}: 설정 정보를 찾을 수 없음\n", "error"))
+                continue
+
+            local_path = sub.get("local_path", "")
+            branch = sub.get("branch", "main")
+
+            # 폴더/깃 확인
+            if not os.path.exists(local_path):
+                error_count += 1
+                self.check_results[repo] = {"status": "missing", "message": "폴더 없음"}
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "📭", "폴더 없음", True))
+                continue
+
+            if not os.path.exists(os.path.join(local_path, ".git")):
+                error_count += 1
+                self.check_results[repo] = {"status": "not-git", "message": "Git 저장소 아님"}
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "Git 저장소 아님", True))
+                continue
+
+            # fetch
+            if token:
+                try:
+                    owner, repo_name = repo.split("/")
+                    token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
+                    run_git(["remote", "set-url", "origin", token_url], local_path)
+                except Exception:
+                    pass
+
+            success, output = run_git(["fetch", "origin"], local_path)
+
+            if token:
+                try:
+                    owner, repo_name = repo.split("/")
+                    clean_url = f"https://github.com/{owner}/{repo_name}.git"
+                    run_git(["remote", "set-url", "origin", clean_url], local_path)
+                except Exception:
+                    pass
+
+            if not success:
+                error_count += 1
+                self.check_results[repo] = {"status": "fetch-failed", "message": output}
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "fetch 실패", True))
+                self.root.after(0, lambda r=repo, o=output: self.append_log(f"  ❌ {r}: fetch 실패: {o}\n", "error"))
+                continue
+
+            # commit 비교
+            local_commit = get_local_commit(local_path)
+            remote_commit = get_remote_commit(local_path, branch)
+
+            if not local_commit or not remote_commit:
+                error_count += 1
+                self.check_results[repo] = {"status": "commit-failed", "message": "커밋 정보 확인 실패"}
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "커밋 확인 실패", True))
+                continue
+
+            if local_commit == remote_commit:
+                self.check_results[repo] = {"status": "up-to-date", "local": local_commit, "remote": remote_commit}
+                self.root.after(0, lambda r=repo, c=local_commit: self._update_tree_item(r, "✅", f"최신({c[:7]})"))
+            else:
+                update_count += 1
+                self.check_results[repo] = {"status": "update-available", "local": local_commit, "remote": remote_commit}
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "🔄", f"업데이트 가능"))
+
+        self.root.after(0, lambda: self.append_log(
+            f"\n✅ 선택 업데이트 확인 완료: {update_count}개 업데이트 가능 | ❌ {error_count}개 오류\n\n",
+            "success" if error_count == 0 else "warning"
+        ))
+        self.root.after(0, lambda: self.set_running(False))
     
-    def _check_and_update_single_thread(self, repo: str):
+    def _check_and_update_single_thread(self, repo: str, manage_running: bool = True):
         """단일 저장소 업데이트 확인 및 업데이트 스레드"""
-        self.root.after(0, lambda: self.set_running(True, f"{repo} 확인 중..."))
+        if manage_running:
+            self.root.after(0, lambda: self.set_running(True, f"{repo} 확인 중..."))
         
         sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
         if not sub:
             self.root.after(0, lambda: self.append_log(f"❌ {repo} 정보를 찾을 수 없음\n"))
-            self.root.after(0, lambda: self.set_running(False))
+            if manage_running:
+                self.root.after(0, lambda: self.set_running(False))
             return
         
         local_path = sub.get("local_path", "")
@@ -597,12 +739,14 @@ class GitSyncGUI:
         # 1. 폴더 존재 확인
         if not os.path.exists(local_path):
             self.root.after(0, lambda: self.append_log(f"  ❌ 로컬 폴더 없음: {local_path}\n"))
-            self.root.after(0, lambda: self.set_running(False))
+            if manage_running:
+                self.root.after(0, lambda: self.set_running(False))
             return
         
         if not os.path.exists(os.path.join(local_path, ".git")):
             self.root.after(0, lambda: self.append_log(f"  ❌ Git 저장소 아님\n"))
-            self.root.after(0, lambda: self.set_running(False))
+            if manage_running:
+                self.root.after(0, lambda: self.set_running(False))
             return
         
         # 2. Fetch
@@ -622,7 +766,8 @@ class GitSyncGUI:
         
         if not success:
             self.root.after(0, lambda: self.append_log(f"  ❌ fetch 실패: {output}\n"))
-            self.root.after(0, lambda: self.set_running(False))
+            if manage_running:
+                self.root.after(0, lambda: self.set_running(False))
             return
         
         # 3. 커밋 비교
@@ -631,14 +776,16 @@ class GitSyncGUI:
         
         if not local_commit or not remote_commit:
             self.root.after(0, lambda: self.append_log(f"  ❌ 커밋 정보 확인 실패\n"))
-            self.root.after(0, lambda: self.set_running(False))
+            if manage_running:
+                self.root.after(0, lambda: self.set_running(False))
             return
         
         # 4. 최신 버전 체크
         if local_commit == remote_commit:
             self.root.after(0, lambda: self.append_log(f"  ✅ 이미 최신 버전입니다\n"))
             self.root.after(0, lambda: self.append_log(f"  커밋: {local_commit[:7]}\n\n"))
-            self.root.after(0, lambda: self.set_running(False))
+            if manage_running:
+                self.root.after(0, lambda: self.set_running(False))
             return
         
         # 5. 업데이트 실행
@@ -672,12 +819,19 @@ class GitSyncGUI:
             self.root.after(0, lambda: self.append_log(f"  새 커밋: {remote_commit[:7]}\n\n"))
             
             # 트리뷰 업데이트
-            self.root.after(0, lambda: self.tree.set(repo, "update", f"✅ {local_commit[:7]} → {remote_commit[:7]}"))
+            self.root.after(0, lambda: self.tree.set(repo, "update_info", f"✅ {local_commit[:7]} → {remote_commit[:7]}"))
         else:
-            self.root.after(0, lambda: self.append_log(f"  ❌ 업데이트 실패: {output}\n\n"))
-            self.root.after(0, lambda: self.tree.set(repo, "update", "❌ 업데이트 실패"))
+            if is_merge_conflict_error(output):
+                self.root.after(0, lambda: self.append_log("  ❌ 업데이트 실패: 머지 충돌(미병합 파일)이 있습니다.\n"))
+                self.root.after(0, lambda: self.append_log("  ▶ 해결: 저장소에서 충돌 해결 후 커밋하거나, merge --abort로 병합을 취소하세요.\n"))
+                self.root.after(0, lambda: self.append_log("  ▶ (원격으로 강제 맞추기는 위험하므로 별도 처리 권장)\n\n"))
+                self.root.after(0, lambda: self.tree.set(repo, "update_info", "⚠️ 충돌 해결 필요"))
+            else:
+                self.root.after(0, lambda: self.append_log(f"  ❌ 업데이트 실패: {output}\n\n"))
+                self.root.after(0, lambda: self.tree.set(repo, "update_info", "❌ 업데이트 실패"))
         
-        self.root.after(0, lambda: self.set_running(False))
+        if manage_running:
+            self.root.after(0, lambda: self.set_running(False))
     
     def menu_open_folder(self):
         """컨텍스트 메뉴: 폴더 열기"""
@@ -972,8 +1126,15 @@ class GitSyncGUI:
                     self._update_last_commit(owner, repo_name, new_commit)
             else:
                 errors += 1
-                self.root.after(0, lambda r=repo, o=output: self.append_log(f"  ❌ 실패: {o}\n", "error"))
-                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "업데이트 실패", True))
+                if is_merge_conflict_error(output):
+                    self.root.after(0, lambda r=repo: self.append_log("  ❌ 실패: 머지 충돌(미병합 파일)이 있습니다.\n", "error"))
+                    self.root.after(0, lambda r=repo: self.append_log("  ▶ 해결: 충돌 해결 후 커밋하거나, merge --abort로 병합을 취소하세요.\n", "warning"))
+                    self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "충돌 해결 필요", True))
+                    self.check_results[repo] = {"status": "conflict", "message": "충돌 해결 필요"}
+                else:
+                    self.root.after(0, lambda r=repo, o=output: self.append_log(f"  ❌ 실패: {o}\n", "error"))
+                    self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "업데이트 실패", True))
+                    self.check_results[repo] = {"status": "update-failed", "message": "업데이트 실패"}
         
         return updated, errors
     
