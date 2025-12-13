@@ -86,6 +86,18 @@ def is_merge_conflict_error(git_output: str) -> bool:
     )
 
 
+def has_unmerged_paths(repo_path: str) -> bool:
+    """현재 작업 트리에 미병합 경로가 있는지(머지 진행/충돌 상태) 빠르게 확인"""
+    success, output = run_git(["status", "--porcelain"], repo_path)
+    if not success:
+        return False
+    # porcelain에서 'UU', 'AA', 'DD', 'AU', 'UA', 'DU', 'UD' 등은 미병합 상태
+    for line in output.splitlines():
+        if len(line) >= 2 and line[:2] in {"UU", "AA", "DD", "AU", "UA", "DU", "UD"}:
+            return True
+    return False
+
+
 def get_local_commit(repo_path: str) -> str | None:
     """로컬 저장소의 현재 HEAD 커밋 SHA"""
     success, output = run_git(["rev-parse", "HEAD"], repo_path)
@@ -239,8 +251,9 @@ class GitSyncGUI:
         self.context_menu.add_command(label="저장소 열기", command=self.menu_open_repo)           # index 4
         self.context_menu.add_separator()                                                          # index 5
         self.context_menu.add_command(label="강제 업데이트", command=self.menu_update)            # index 6
-        self.context_menu.add_separator()                                                          # index 7
-        self.context_menu.add_command(label="삭제", command=self.menu_delete)                     # index 8
+        self.context_menu.add_command(label="재다운로드(재클론)", command=self.menu_reclone)      # index 7
+        self.context_menu.add_separator()                                                          # index 8
+        self.context_menu.add_command(label="삭제", command=self.menu_delete)                     # index 9
         
     # 출력 영역
         output_frame = ttk.LabelFrame(main_frame, text="로그", padding="5")
@@ -272,6 +285,107 @@ class GitSyncGUI:
             self.output.insert(tk.END, text)
         self.output.see(tk.END)
         self.output.config(state=tk.DISABLED)
+
+    def _abort_merge(self, repo_path: str) -> tuple[bool, str]:
+        """진행 중인 merge를 취소"""
+        return run_git(["merge", "--abort"], repo_path)
+
+    def _hard_reset_to_remote(self, repo_path: str, branch: str) -> tuple[bool, str]:
+        """로컬 변경을 폐기하고 origin/branch로 강제 맞춤 (위험)"""
+        ok, out = run_git(["reset", "--hard", f"origin/{branch}"], repo_path)
+        if not ok:
+            return ok, out
+        ok2, out2 = run_git(["clean", "-fd"], repo_path)
+        if not ok2:
+            return ok2, out2
+        return True, (out + "\n" + out2).strip()
+
+    def _pull_with_token(self, repo: str, repo_path: str, branch: str, token: str) -> tuple[bool, str]:
+        """토큰 설정/복원까지 포함한 pull 실행"""
+        if token:
+            try:
+                owner, repo_name = repo.split("/")
+                token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
+                run_git(["remote", "set-url", "origin", token_url], repo_path)
+            except Exception:
+                pass
+
+        success, output = run_git(["pull", "origin", branch], repo_path)
+
+        if token:
+            try:
+                owner, repo_name = repo.split("/")
+                clean_url = f"https://github.com/{owner}/{repo_name}.git"
+                run_git(["remote", "set-url", "origin", clean_url], repo_path)
+            except Exception:
+                pass
+
+        return success, output
+
+    def _log_git_status_summary(self, repo_path: str):
+        """충돌/실패 상황에서 원인 파악을 돕는 최소한의 상태 요약 로그"""
+        ok, out = run_git(["status", "-sb"], repo_path)
+        if ok and out:
+            self.root.after(0, lambda o=out: self.append_log(f"  ℹ️ status -sb: {o}\n", "info"))
+        ok2, out2 = run_git(["status", "--porcelain"], repo_path)
+        if ok2 and out2:
+            lines = out2.splitlines()
+            preview = "\n".join(lines[:10])
+            suffix = "\n  ..." if len(lines) > 10 else ""
+            self.root.after(0, lambda p=preview, s=suffix: self.append_log(f"  ℹ️ status --porcelain:\n{p}{s}\n", "info"))
+
+    def _auto_recover_and_pull(self, repo: str, repo_path: str, branch: str, token: str) -> tuple[bool, str]:
+        """머지 충돌/미병합 파일이 있더라도 무인으로 최신 상태까지 맞추려 시도.
+
+        전략:
+          1) merge --abort
+          2) pull 재시도
+          3) 여전히 충돌이면 fetch 후 reset --hard origin/branch + clean -fd
+          4) checkout -f branch (브랜치/DETACHED 등 꼬임 대비)
+          5) 최종 pull
+        """
+        self._log_git_status_summary(repo_path)
+
+        # 1) merge --abort
+        self.root.after(0, lambda: self.append_log("  ▶ 자동 복구: merge --abort 시도\n", "warning"))
+        ok_abort, out_abort = self._abort_merge(repo_path)
+        if ok_abort:
+            self.root.after(0, lambda: self.append_log("  ✅ merge --abort 완료\n", "info"))
+        else:
+            # merge 중이 아니면 실패할 수 있으니 정보성 로그만
+            if out_abort:
+                self.root.after(0, lambda o=out_abort: self.append_log(f"  ℹ️ merge --abort: {o}\n", "info"))
+
+        # 2) pull 재시도
+        self.root.after(0, lambda: self.append_log("  ▶ 재시도: pull\n", "warning"))
+        ok_pull, out_pull = self._pull_with_token(repo, repo_path, branch, token)
+        if ok_pull:
+            return True, out_pull
+
+        # 여전히 충돌/미병합이면 강제 맞춤
+        if not (is_merge_conflict_error(out_pull) or has_unmerged_paths(repo_path)):
+            return False, out_pull
+
+        self.root.after(0, lambda: self.append_log("  ⚠️ 재시도도 충돌. 로컬을 원격으로 강제 맞춤합니다.\n", "warning"))
+
+        # 3) fetch
+        ok_fetch, out_fetch = run_git(["fetch", "origin"], repo_path)
+        if not ok_fetch:
+            return False, f"fetch 실패: {out_fetch}"
+
+        # 4) reset + clean
+        ok_reset, out_reset = self._hard_reset_to_remote(repo_path, branch)
+        if not ok_reset:
+            return False, f"reset/clean 실패: {out_reset}"
+
+        # 5) checkout -f branch
+        run_git(["checkout", "-f", branch], repo_path)
+
+        # 6) 최종 pull
+        ok_pull2, out_pull2 = self._pull_with_token(repo, repo_path, branch, token)
+        if ok_pull2:
+            return True, out_pull2
+        return False, out_pull2
     
     def clear_log(self):
         """로그 클리어"""
@@ -591,6 +705,12 @@ class GitSyncGUI:
                 self.context_menu.entryconfig(6, state=tk.NORMAL)
             else:
                 self.context_menu.entryconfig(6, state=tk.DISABLED)
+
+            # 재다운로드(재클론) (index 7) - 작업 중이 아니면 활성화 (폴더 없어도 가능)
+            if not self.is_running:
+                self.context_menu.entryconfig(7, state=tk.NORMAL)
+            else:
+                self.context_menu.entryconfig(7, state=tk.DISABLED)
             
             # 폴더 열기 메뉴 (index 3) - 폴더가 없으면 비활성화
             if sub and os.path.exists(sub.get("local_path", "")):
@@ -791,19 +911,9 @@ class GitSyncGUI:
         # 5. 업데이트 실행
         self.root.after(0, lambda: self.append_log(f"  🔄 업데이트 필요: {local_commit[:7]} → {remote_commit[:7]}\n"))
         self.root.after(0, lambda: self.append_log(f"  ⬇️ 업데이트 중...\n"))
-        
-        if token:
-            owner, repo_name = repo.split("/")
-            token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
-            run_git(["remote", "set-url", "origin", token_url], local_path)
-        
-        success, output = run_git(["pull", "origin", branch], local_path)
-        
-        if token:
-            owner, repo_name = repo.split("/")
-            clean_url = f"https://github.com/{owner}/{repo_name}.git"
-            run_git(["remote", "set-url", "origin", clean_url], local_path)
-        
+
+        success, output = self._pull_with_token(repo, local_path, branch, token)
+
         if success:
             # 커밋 SHA 업데이트
             new_commit = get_local_commit(local_path)
@@ -815,19 +925,31 @@ class GitSyncGUI:
                         break
                 save_repos(repos_data)
             
-            self.root.after(0, lambda: self.append_log(f"  ✅ 업데이트 완료!\n"))
-            self.root.after(0, lambda: self.append_log(f"  새 커밋: {remote_commit[:7]}\n\n"))
+            self.root.after(0, lambda: self.append_log("  ✅ 업데이트 완료!\n", "success"))
+            self.root.after(0, lambda: self.append_log(f"  새 커밋: {remote_commit[:7]}\n\n", "info"))
             
             # 트리뷰 업데이트
             self.root.after(0, lambda: self.tree.set(repo, "update_info", f"✅ {local_commit[:7]} → {remote_commit[:7]}"))
         else:
-            if is_merge_conflict_error(output):
-                self.root.after(0, lambda: self.append_log("  ❌ 업데이트 실패: 머지 충돌(미병합 파일)이 있습니다.\n"))
-                self.root.after(0, lambda: self.append_log("  ▶ 해결: 저장소에서 충돌 해결 후 커밋하거나, merge --abort로 병합을 취소하세요.\n"))
-                self.root.after(0, lambda: self.append_log("  ▶ (원격으로 강제 맞추기는 위험하므로 별도 처리 권장)\n\n"))
-                self.root.after(0, lambda: self.tree.set(repo, "update_info", "⚠️ 충돌 해결 필요"))
+            if is_merge_conflict_error(output) or has_unmerged_paths(local_path):
+                self.root.after(0, lambda: self.append_log("  ❌ 업데이트 실패: 머지 충돌(미병합 파일)이 있습니다.\n", "error"))
+                ok2, out2 = self._auto_recover_and_pull(repo, local_path, branch, token)
+                if ok2:
+                    new_commit = get_local_commit(local_path)
+                    if new_commit:
+                        repos_data = load_repos()
+                        for s in repos_data.get("subscriptions", []):
+                            if s.get("repo") == repo:
+                                s["last_commit"] = new_commit
+                                break
+                        save_repos(repos_data)
+                    self.root.after(0, lambda: self.append_log("  ✅ 자동 복구 후 업데이트 완료!\n\n", "success"))
+                    self.root.after(0, lambda: self.tree.set(repo, "update_info", "✅ 업데이트 완료"))
+                else:
+                    self.root.after(0, lambda o=out2: self.append_log(f"  ❌ 자동 복구 실패: {o}\n\n", "error"))
+                    self.root.after(0, lambda: self.tree.set(repo, "update_info", "⚠️ 업데이트 실패"))
             else:
-                self.root.after(0, lambda: self.append_log(f"  ❌ 업데이트 실패: {output}\n\n"))
+                self.root.after(0, lambda: self.append_log(f"  ❌ 업데이트 실패: {output}\n\n", "error"))
                 self.root.after(0, lambda: self.tree.set(repo, "update_info", "❌ 업데이트 실패"))
         
         if manage_running:
@@ -859,6 +981,137 @@ class GitSyncGUI:
             repo = sub.get("repo", "")
             thread = threading.Thread(target=self._sync_thread, args=([repo],), daemon=True)
             thread.start()
+
+    def menu_reclone(self):
+        """컨텍스트 메뉴: 선택한(1개 또는 여러개) 저장소를 로컬 삭제 후 재클론"""
+        if self.is_running:
+            return
+
+        selection = list(self.tree.selection())
+        if not selection:
+            return
+
+        # 위험 작업: 확인
+        if not messagebox.askyesno(
+            "재다운로드(재클론) 확인",
+            f"선택한 {len(selection)}개 저장소의 로컬 폴더를 삭제한 뒤 다시 다운로드(클론)합니다.\n\n"
+            "⚠️ 로컬 변경사항/미추적 파일은 모두 삭제됩니다.\n"
+            "계속하시겠습니까?",
+            icon="warning",
+        ):
+            return
+
+        thread = threading.Thread(target=self._reclone_selected_thread, args=(selection,), daemon=True)
+        thread.start()
+
+    def _delete_folder_tree(self, local_path: str) -> tuple[bool, str]:
+        """Windows 포함: 로컬 폴더를 최대한 강제로 삭제"""
+        if not os.path.exists(local_path):
+            return True, "(폴더 없음)"
+        try:
+            import shutil
+            import stat
+
+            def remove_readonly(func, path, excinfo):
+                try:
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+                except Exception:
+                    pass
+
+            shutil.rmtree(local_path, onerror=remove_readonly)
+            return True, ""
+        except Exception as e:
+            # 대체 방법(rmdir)
+            try:
+                result = subprocess.run(
+                    ["cmd", "/c", "rmdir", "/s", "/q", local_path],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    return True, ""
+                return False, (result.stdout + result.stderr).strip() or str(e)
+            except Exception as e2:
+                return False, str(e2)
+
+    def _clone_repo(self, repo_full: str, local_path: str, token: str) -> tuple[bool, str]:
+        """지정 경로로 저장소를 클론한다. (기본: --recursive)"""
+        try:
+            owner, name = repo_full.split("/")
+        except ValueError:
+            return False, f"잘못된 repo 형식: {repo_full}"
+
+        url = f"https://github.com/{owner}/{name}.git"
+        if token:
+            url = f"https://{token}@github.com/{owner}/{name}.git"
+
+        parent = os.path.dirname(local_path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        # submodule 많은 repo 대비 --recursive
+        return run_git(["clone", "--recursive", url, local_path], cwd=None)
+
+    def _reclone_selected_thread(self, repos: list[str]):
+        """선택 저장소들을 순차적으로 재클론"""
+        self.root.after(0, lambda: self.set_running(True, f"재다운로드 중... ({len(repos)}개)"))
+        self.root.after(0, lambda: self.append_log(f"\n♻️ 선택 {len(repos)}개 저장소 재다운로드(재클론) 시작\n", "info"))
+
+        token = self.env_config.get("GITHUB_TOKEN", "")
+        ok_count = 0
+        fail_count = 0
+
+        for repo in repos:
+            sub = next((s for s in self.subscriptions if s.get("repo") == repo), None)
+            if not sub:
+                fail_count += 1
+                self.root.after(0, lambda r=repo: self.append_log(f"  ❌ {r}: 설정 정보를 찾을 수 없음\n", "error"))
+                continue
+
+            local_path = sub.get("local_path", "")
+            if not local_path:
+                fail_count += 1
+                self.root.after(0, lambda r=repo: self.append_log(f"  ❌ {r}: local_path가 비어있음\n", "error"))
+                continue
+
+            self.root.after(0, lambda r=repo: self.append_log(f"\n🧹 {r}: 로컬 폴더 정리 중...\n", "info"))
+            self.root.after(0, lambda r=repo: self._update_tree_item(r, "♻️", "재다운로드 준비"))
+
+            ok_del, out_del = self._delete_folder_tree(local_path)
+            if not ok_del:
+                fail_count += 1
+                self.root.after(0, lambda r=repo, o=out_del: self.append_log(f"  ❌ 삭제 실패: {o}\n", "error"))
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "삭제 실패", True))
+                continue
+
+            self.root.after(0, lambda r=repo: self.append_log(f"  ⬇️ {r}: 클론 중...\n", "info"))
+            ok_clone, out_clone = self._clone_repo(repo, local_path, token)
+            if not ok_clone:
+                fail_count += 1
+                self.root.after(0, lambda r=repo, o=out_clone: self.append_log(f"  ❌ 클론 실패: {o}\n", "error"))
+                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "클론 실패", True))
+                continue
+
+            # last_commit 업데이트
+            new_commit = get_local_commit(local_path)
+            if new_commit:
+                repos_data = load_repos()
+                for s in repos_data.get("subscriptions", []):
+                    if s.get("repo") == repo:
+                        s["last_commit"] = new_commit
+                        break
+                save_repos(repos_data)
+
+            ok_count += 1
+            self.root.after(0, lambda r=repo: self.append_log("  ✅ 재다운로드 완료\n", "success"))
+            self.root.after(0, lambda r=repo: self._update_tree_item(r, "✅", "재다운로드 완료"))
+
+        self.root.after(0, lambda: self.append_log(
+            f"\n✅ 재다운로드 완료: {ok_count}개 성공 | ❌ {fail_count}개 실패\n\n",
+            "success" if fail_count == 0 else "warning",
+        ))
+        self.root.after(0, lambda: self.set_running(False))
     
     def menu_delete(self):
         """컨텍스트 메뉴: 선택한 저장소 삭제 (로컬 폴더 + JSON)"""
@@ -1105,15 +1358,7 @@ class GitSyncGUI:
                 continue
             
             owner, repo_name = repo.split("/")
-            if token:
-                token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
-                run_git(["remote", "set-url", "origin", token_url], local_path)
-            
-            success, output = run_git(["pull", "origin", branch], local_path)
-            
-            if token:
-                clean_url = f"https://github.com/{owner}/{repo_name}.git"
-                run_git(["remote", "set-url", "origin", clean_url], local_path)
+            success, output = self._pull_with_token(repo, local_path, branch, token)
             
             if success:
                 updated += 1
@@ -1126,11 +1371,23 @@ class GitSyncGUI:
                     self._update_last_commit(owner, repo_name, new_commit)
             else:
                 errors += 1
-                if is_merge_conflict_error(output):
+                if is_merge_conflict_error(output) or has_unmerged_paths(local_path):
                     self.root.after(0, lambda r=repo: self.append_log("  ❌ 실패: 머지 충돌(미병합 파일)이 있습니다.\n", "error"))
-                    self.root.after(0, lambda r=repo: self.append_log("  ▶ 해결: 충돌 해결 후 커밋하거나, merge --abort로 병합을 취소하세요.\n", "warning"))
-                    self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "충돌 해결 필요", True))
-                    self.check_results[repo] = {"status": "conflict", "message": "충돌 해결 필요"}
+                    ok2, out2 = self._auto_recover_and_pull(repo, local_path, branch, token)
+                    if ok2:
+                        updated += 1
+                        new_commit = get_local_commit(local_path)
+                        self.root.after(0, lambda r=repo: self.append_log("  ✅ 자동 복구 후 업데이트 완료\n", "success"))
+                        self.root.after(0, lambda r=repo: self._update_tree_item(r, "✅", "최신 상태"))
+                        self.check_results[repo] = {"status": "up-to-date", "message": "최신 상태"}
+                        if new_commit:
+                            self._update_last_commit(owner, repo_name, new_commit)
+                        # errors는 복구 성공했으니 되돌림
+                        errors -= 1
+                    else:
+                        self.root.after(0, lambda r=repo, o=out2: self.append_log(f"  ❌ 자동 복구 실패: {o}\n", "error"))
+                        self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "업데이트 실패", True))
+                        self.check_results[repo] = {"status": "update-failed", "message": "업데이트 실패"}
                 else:
                     self.root.after(0, lambda r=repo, o=output: self.append_log(f"  ❌ 실패: {o}\n", "error"))
                     self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "업데이트 실패", True))
