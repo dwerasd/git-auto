@@ -250,12 +250,15 @@ class GitSyncGUI:
         self.context_menu.add_command(label="폴더 열기", command=self.menu_open_folder)           # index 3
         self.context_menu.add_command(label="저장소 열기", command=self.menu_open_repo)           # index 4
         self.context_menu.add_separator()                                                          # index 5
-        self.context_menu.add_command(label="강제 업데이트", command=self.menu_update)            # index 6
-        self.context_menu.add_command(label="재다운로드(재클론)", command=self.menu_reclone)      # index 7
+        self.context_menu.add_command(label="자동업데이트 켜기(선택)", command=lambda: self.menu_set_auto_update_selected(True))   # index 6
+        self.context_menu.add_command(label="자동업데이트 끄기(선택)", command=lambda: self.menu_set_auto_update_selected(False))  # index 7
         self.context_menu.add_separator()                                                          # index 8
-        self.context_menu.add_command(label="삭제", command=self.menu_delete)                     # index 9
+        self.context_menu.add_command(label="강제 업데이트", command=self.menu_update)            # index 9
+        self.context_menu.add_command(label="재다운로드(재클론)", command=self.menu_reclone)      # index 10
+        self.context_menu.add_separator()                                                          # index 11
+        self.context_menu.add_command(label="삭제", command=self.menu_delete)                     # index 12
         
-    # 출력 영역
+        # 출력 영역
         output_frame = ttk.LabelFrame(main_frame, text="로그", padding="5")
         output_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -695,22 +698,30 @@ class GitSyncGUI:
                 self.context_menu.entryconfig(1, state=tk.NORMAL)
             else:
                 self.context_menu.entryconfig(1, state=tk.DISABLED)
+
+            # 자동업데이트 일괄 ON/OFF (index 6, 7) - 선택이 있고 작업 중이 아닐 때만 활성화
+            if not self.is_running and self.tree.selection():
+                self.context_menu.entryconfig(6, state=tk.NORMAL)
+                self.context_menu.entryconfig(7, state=tk.NORMAL)
+            else:
+                self.context_menu.entryconfig(6, state=tk.DISABLED)
+                self.context_menu.entryconfig(7, state=tk.DISABLED)
             
-            # 강제 업데이트 메뉴 (index 6) 활성화/비활성화 결정
+            # 강제 업데이트 메뉴 (index 9) 활성화/비활성화 결정
             result = self.check_results.get(repo, {})
             status = result.get("status", "")
             
             # 업데이트 가능한 경우에만 활성화
             if status == "update-available":
-                self.context_menu.entryconfig(6, state=tk.NORMAL)
+                self.context_menu.entryconfig(9, state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig(6, state=tk.DISABLED)
+                self.context_menu.entryconfig(9, state=tk.DISABLED)
 
-            # 재다운로드(재클론) (index 7) - 작업 중이 아니면 활성화 (폴더 없어도 가능)
+            # 재다운로드(재클론) (index 10) - 작업 중이 아니면 활성화 (폴더 없어도 가능)
             if not self.is_running:
-                self.context_menu.entryconfig(7, state=tk.NORMAL)
+                self.context_menu.entryconfig(10, state=tk.NORMAL)
             else:
-                self.context_menu.entryconfig(7, state=tk.DISABLED)
+                self.context_menu.entryconfig(10, state=tk.DISABLED)
             
             # 폴더 열기 메뉴 (index 3) - 폴더가 없으면 비활성화
             if sub and os.path.exists(sub.get("local_path", "")):
@@ -719,6 +730,47 @@ class GitSyncGUI:
                 self.context_menu.entryconfig(3, state=tk.DISABLED)
             
             self.context_menu.post(event.x_root, event.y_root)
+
+    def menu_set_auto_update_selected(self, new_state: bool):
+        """컨텍스트 메뉴: 선택한(1개 또는 여러개) 저장소의 자동업데이트를 일괄 설정"""
+        if self.is_running:
+            return
+
+        selection = list(self.tree.selection())
+        if not selection:
+            return
+
+        # subscriptions에서 일괄 반영
+        changed = 0
+        selected_set = set(selection)
+        for sub in self.subscriptions:
+            repo = sub.get("repo")
+            if repo in selected_set:
+                if sub.get("auto_update", False) != new_state:
+                    sub["auto_update"] = new_state
+                    changed += 1
+
+        # 변화가 없다면 그대로 종료
+        if changed == 0:
+            return
+
+        # auto_update 그룹 정렬(ON 먼저) + 같은 그룹 내에서는 현재 순서 유지
+        def _group_key(s: dict) -> int:
+            return 0 if s.get("auto_update", True) else 1
+
+        # stable sort라서 기존 순서가 유지됨
+        self.subscriptions.sort(key=_group_key)
+
+        # repos.json 저장
+        repos_data = load_repos()
+        repos_data["subscriptions"] = self.subscriptions
+        save_repos(repos_data)
+
+        # 트리뷰 갱신
+        self._refresh_tree_order()
+
+        state_text = "활성화" if new_state else "비활성화"
+        self.append_log(f"🔁 선택 {len(selection)}개 자동업데이트 {state_text} (변경 {changed}개)\n", "info")
     
     def menu_check_and_update(self):
         """컨텍스트 메뉴: 선택한(1개 또는 여러개) 저장소를 업데이트 확인 후 필요시 업데이트"""
