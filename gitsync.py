@@ -146,6 +146,32 @@ def run_git(args: list[str], cwd: str | None = None) -> tuple[bool, str]:
         return False, str(e)
 
 
+def is_merge_conflict_error(git_output: str) -> bool:
+    """git 출력이 머지 충돌(미병합 파일)로 인한 실패인지 여부"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "unmerged" in text
+        or "unmerged files" in text
+        or "fix conflicts" in text
+        or "unresolved conflict" in text
+        or "you have unmerged paths" in text
+    )
+
+
+def has_unmerged_paths(repo_path: str) -> bool:
+    """현재 작업 트리에 미병합 경로가 있는지(머지 진행/충돌 상태) 빠르게 확인"""
+    success, output = run_git(["status", "--porcelain"], repo_path)
+    if not success:
+        return False
+    # porcelain에서 'UU', 'AA', 'DD', 'AU', 'UA', 'DU', 'UD' 등은 미병합 상태
+    for line in output.splitlines():
+        if len(line) >= 2 and line[:2] in {"UU", "AA", "DD", "AU", "UA", "DU", "UD"}:
+            return True
+    return False
+
+
 def get_local_commit(repo_path: str) -> str | None:
     """로컬 저장소의 현재 HEAD 커밋 SHA"""
     success, output = run_git(["rev-parse", "HEAD"], repo_path)
@@ -156,6 +182,101 @@ def get_remote_commit(repo_path: str, branch: str = "main") -> str | None:
     """원격 저장소의 최신 커밋 SHA (fetch 후)"""
     success, output = run_git(["rev-parse", f"origin/{branch}"], repo_path)
     return output if success else None
+
+
+def _set_remote_url_with_token(repo_full: str, repo_path: str, token: str) -> None:
+    """origin URL에 토큰을 임시로 삽입"""
+    if not token:
+        return
+    try:
+        owner, repo_name = repo_full.split("/")
+        token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
+        run_git(["remote", "set-url", "origin", token_url], repo_path)
+    except Exception:
+        pass
+
+
+def _restore_remote_url(repo_full: str, repo_path: str, token: str) -> None:
+    """origin URL에서 토큰 제거(보안)"""
+    if not token:
+        return
+    try:
+        owner, repo_name = repo_full.split("/")
+        clean_url = f"https://github.com/{owner}/{repo_name}.git"
+        run_git(["remote", "set-url", "origin", clean_url], repo_path)
+    except Exception:
+        pass
+
+
+def pull_with_token(repo_full: str, repo_path: str, branch: str, token: str) -> tuple[bool, str]:
+    """토큰 설정/복원까지 포함한 pull 실행"""
+    _set_remote_url_with_token(repo_full, repo_path, token)
+    success, output = run_git(["pull", "origin", branch], repo_path)
+    _restore_remote_url(repo_full, repo_path, token)
+    return success, output
+
+
+def fetch_with_token(repo_full: str, repo_path: str, token: str) -> tuple[bool, str]:
+    """토큰 설정/복원까지 포함한 fetch 실행"""
+    _set_remote_url_with_token(repo_full, repo_path, token)
+    success, output = run_git(["fetch", "origin"], repo_path)
+    _restore_remote_url(repo_full, repo_path, token)
+    return success, output
+
+
+def abort_merge(repo_path: str) -> tuple[bool, str]:
+    """진행 중인 merge를 취소"""
+    return run_git(["merge", "--abort"], repo_path)
+
+
+def hard_reset_to_remote(repo_path: str, branch: str) -> tuple[bool, str]:
+    """로컬 변경을 폐기하고 origin/branch로 강제 맞춤 (위험)"""
+    ok, out = run_git(["reset", "--hard", f"origin/{branch}"], repo_path)
+    if not ok:
+        return ok, out
+    ok2, out2 = run_git(["clean", "-fd"], repo_path)
+    if not ok2:
+        return ok2, out2
+    return True, (out + "\n" + out2).strip()
+
+
+def auto_recover_and_pull(repo_full: str, repo_path: str, branch: str, token: str) -> tuple[bool, str]:
+    """머지 충돌/미병합 파일이 있더라도 무인으로 최신 상태까지 맞추려 시도.
+
+    전략:
+      1) merge --abort
+      2) pull 재시도
+      3) 여전히 충돌이면 fetch 후 reset --hard origin/branch + clean -fd
+      4) checkout -f branch (브랜치/DETACHED 등 꼬임 대비)
+      5) 최종 pull
+    """
+    # 1) merge --abort
+    abort_merge(repo_path)
+
+    # 2) pull 재시도
+    ok_pull, out_pull = pull_with_token(repo_full, repo_path, branch, token)
+    if ok_pull:
+        return True, out_pull
+
+    # 충돌/미병합이 아니면 이 루틴으로 해결 불가
+    if not (is_merge_conflict_error(out_pull) or has_unmerged_paths(repo_path)):
+        return False, out_pull
+
+    # 3) fetch
+    ok_fetch, out_fetch = fetch_with_token(repo_full, repo_path, token)
+    if not ok_fetch:
+        return False, f"fetch 실패: {out_fetch}"
+
+    # 4) reset + clean
+    ok_reset, out_reset = hard_reset_to_remote(repo_path, branch)
+    if not ok_reset:
+        return False, f"reset/clean 실패: {out_reset}"
+
+    # 5) checkout -f branch
+    run_git(["checkout", "-f", branch], repo_path)
+
+    # 6) 최종 pull
+    return pull_with_token(repo_full, repo_path, branch, token)
 
 
 def sync_repository(sub: dict, token: str) -> dict:
@@ -183,12 +304,7 @@ def sync_repository(sub: dict, token: str) -> dict:
         run_git(["remote", "set-url", "origin", token_url], local_path)
     
     # fetch로 원격 정보 가져오기
-    success, output = run_git(["fetch", "origin"], local_path)
-    
-    # 토큰 URL 제거 (보안)
-    if token:
-        clean_url = f"https://github.com/{owner}/{repo_name}.git"
-        run_git(["remote", "set-url", "origin", clean_url], local_path)
+    success, output = fetch_with_token(repo, local_path, token)
     
     if not success:
         return {"status": "error", "message": f"fetch 실패: {output}"}
@@ -204,18 +320,20 @@ def sync_repository(sub: dict, token: str) -> dict:
         return {"status": "up-to-date", "message": "최신 상태"}
     
     # 업데이트 필요 - pull 실행
-    if token:
-        token_url = f"https://{token}@github.com/{owner}/{repo_name}.git"
-        run_git(["remote", "set-url", "origin", token_url], local_path)
-    
-    success, output = run_git(["pull", "origin", branch], local_path)
-    
-    # 토큰 URL 제거 (보안)
-    if token:
-        clean_url = f"https://github.com/{owner}/{repo_name}.git"
-        run_git(["remote", "set-url", "origin", clean_url], local_path)
-    
+    success, output = pull_with_token(repo, local_path, branch, token)
+
     if not success:
+        # GUI와 동일하게: 충돌이면 무인 자동 복구로 최신까지 맞추기
+        if is_merge_conflict_error(output) or has_unmerged_paths(local_path):
+            ok2, out2 = auto_recover_and_pull(repo, local_path, branch, token)
+            if not ok2:
+                return {"status": "error", "message": f"자동 복구 실패: {out2}"}
+            # 복구 후 새 커밋 SHA 저장
+            new_commit = get_local_commit(local_path)
+            if new_commit:
+                update_last_commit(owner, repo_name, new_commit)
+            return {"status": "updated", "message": "자동 복구 후 업데이트 완료"}
+
         return {"status": "error", "message": f"pull 실패: {output}"}
     
     # 새 커밋 SHA 저장
@@ -245,6 +363,7 @@ def sync_all():
     print(f" 구독 저장소 동기화")
     print(f"{'='*60}")
     print(f"  총 {len(subscriptions)}개 저장소 확인")
+    print("  (gitsync.py는 실행 시 모든 항목을 자동 업데이트합니다: auto_update 플래그 무시)")
     print()
     
     updated = 0
