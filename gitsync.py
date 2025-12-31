@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -147,7 +148,7 @@ def run_git(args: list[str], cwd: str | None = None) -> tuple[bool, str]:
 
 
 def is_merge_conflict_error(git_output: str) -> bool:
-    """git 출력이 머지 충돌(미병합 파일)로 인한 실패인지 여부"""
+    """git 출력이 머지 충돌(미병합 파일) 또는 히스토리 불일치로 인한 실패인지 여부"""
     if not git_output:
         return False
     text = git_output.lower()
@@ -157,6 +158,7 @@ def is_merge_conflict_error(git_output: str) -> bool:
         or "fix conflicts" in text
         or "unresolved conflict" in text
         or "you have unmerged paths" in text
+        or "unrelated histories" in text  # 히스토리 완전 불일치(force push 등)
     )
 
 
@@ -229,6 +231,23 @@ def abort_merge(repo_path: str) -> tuple[bool, str]:
     return run_git(["merge", "--abort"], repo_path)
 
 
+def backup_local_folder(repo_path: str) -> tuple[bool, str]:
+    """강제 리셋 전 로컬 폴더를 백업 (unrelated histories 등 대비)
+    
+    Returns:
+        (success, backup_path or error_message)
+    """
+    if not os.path.exists(repo_path):
+        return True, "(폴더 없음)"
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = f"{repo_path}_backup_{timestamp}"
+        shutil.copytree(repo_path, backup_path)
+        return True, backup_path
+    except Exception as e:
+        return False, str(e)
+
+
 def hard_reset_to_remote(repo_path: str, branch: str) -> tuple[bool, str]:
     """로컬 변경을 폐기하고 origin/branch로 강제 맞춤 (위험)"""
     ok, out = run_git(["reset", "--hard", f"origin/{branch}"], repo_path)
@@ -261,6 +280,11 @@ def auto_recover_and_pull(repo_full: str, repo_path: str, branch: str, token: st
     # 충돌/미병합이 아니면 이 루틴으로 해결 불가
     if not (is_merge_conflict_error(out_pull) or has_unmerged_paths(repo_path)):
         return False, out_pull
+
+    # 강제 리셋 전 로컬 백업 (unrelated histories 등 대비)
+    ok_backup, backup_result = backup_local_folder(repo_path)
+    if ok_backup and backup_result != "(폴더 없음)":
+        print(f"  📦 로컬 백업 완료: {backup_result}")
 
     # 3) fetch
     ok_fetch, out_fetch = fetch_with_token(repo_full, repo_path, token)
