@@ -186,6 +186,23 @@ def get_remote_commit(repo_path: str, branch: str = "main") -> str | None:
     return output if success else None
 
 
+def get_behind_ahead_count(repo_path: str, branch: str) -> tuple[int, int]:
+    """로컬이 원격보다 뒤처진(behind)/앞선(ahead) 커밋 수 반환
+    
+    Returns:
+        (behind_count, ahead_count)
+    """
+    # behind: HEAD..origin/branch
+    ok1, out1 = run_git(["rev-list", "--count", f"HEAD..origin/{branch}"], repo_path)
+    behind = int(out1) if ok1 and out1.isdigit() else 0
+    
+    # ahead: origin/branch..HEAD
+    ok2, out2 = run_git(["rev-list", "--count", f"origin/{branch}..HEAD"], repo_path)
+    ahead = int(out2) if ok2 and out2.isdigit() else 0
+    
+    return behind, ahead
+
+
 def _set_remote_url_with_token(repo_full: str, repo_path: str, token: str) -> None:
     """origin URL에 토큰을 임시로 삽입"""
     if not token:
@@ -340,10 +357,29 @@ def sync_repository(sub: dict, token: str) -> dict:
     if not local_commit or not remote_commit:
         return {"status": "error", "message": "커밋 정보 확인 실패"}
     
-    if local_commit == remote_commit:
+    # behind/ahead 확인
+    behind, ahead = get_behind_ahead_count(local_path, branch)
+    
+    if behind == 0 and ahead == 0:
+        # 동일한 상태
         return {"status": "up-to-date", "message": "최신 상태"}
     
-    # 업데이트 필요 - pull 실행
+    if behind == 0 and ahead > 0:
+        # 로컬이 앞선 있음 (원격에서 force push 됐을 수 있음) - 강제 리셋 필요
+        print(f"  ⚠️ 로컬이 {ahead}커밋 앞서있음 (원격 force push?). 강제 리셋 시도...")
+        # 백업 후 강제 리셋
+        ok_backup, backup_result = backup_local_folder(local_path)
+        if ok_backup and backup_result != "(폴더 없음)":
+            print(f"  📦 로컬 백업: {backup_result}")
+        ok_reset, out_reset = hard_reset_to_remote(local_path, branch)
+        if not ok_reset:
+            return {"status": "error", "message": f"강제 리셋 실패: {out_reset}"}
+        new_commit = get_local_commit(local_path)
+        if new_commit:
+            update_last_commit(owner, repo_name, new_commit)
+        return {"status": "updated", "message": f"강제 리셋: {local_commit[:7]} → {remote_commit[:7]}"}
+    
+    # behind > 0: 업데이트 필요 - pull 실행
     success, output = pull_with_token(repo, local_path, branch, token)
 
     if not success:

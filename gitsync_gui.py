@@ -113,6 +113,23 @@ def get_remote_commit(repo_path: str, branch: str = "main") -> str | None:
     return output if success else None
 
 
+def get_behind_ahead_count(repo_path: str, branch: str) -> tuple[int, int]:
+    """로컬이 원격보다 뒤처진(behind)/앞선(ahead) 커밋 수 반환
+    
+    Returns:
+        (behind_count, ahead_count)
+    """
+    # behind: HEAD..origin/branch
+    ok1, out1 = run_git(["rev-list", "--count", f"HEAD..origin/{branch}"], repo_path)
+    behind = int(out1) if ok1 and out1.isdigit() else 0
+    
+    # ahead: origin/branch..HEAD
+    ok2, out2 = run_git(["rev-list", "--count", f"origin/{branch}..HEAD"], repo_path)
+    ahead = int(out2) if ok2 and out2.isdigit() else 0
+    
+    return behind, ahead
+
+
 class GitSyncGUI:
     def __init__(self, root):
         self.root = root
@@ -902,13 +919,21 @@ class GitSyncGUI:
                 self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "커밋 확인 실패", True))
                 continue
 
-            if local_commit == remote_commit:
+            # behind/ahead 확인
+            behind, ahead = get_behind_ahead_count(local_path, branch)
+            
+            if behind == 0 and ahead == 0:
                 self.check_results[repo] = {"status": "up-to-date", "local": local_commit, "remote": remote_commit}
                 self.root.after(0, lambda r=repo, c=local_commit: self._update_tree_item(r, "✅", f"최신({c[:7]})"))
+            elif behind == 0 and ahead > 0:
+                # 로컬이 앞서있음 (원격 force push?) - 강제 리셋 필요
+                update_count += 1
+                self.check_results[repo] = {"status": "update-available", "local": local_commit, "remote": remote_commit, "ahead": ahead}
+                self.root.after(0, lambda r=repo, a=ahead: self._update_tree_item(r, "⚠️", f"강제리셋필요(ahead {a})"))
             else:
                 update_count += 1
-                self.check_results[repo] = {"status": "update-available", "local": local_commit, "remote": remote_commit}
-                self.root.after(0, lambda r=repo: self._update_tree_item(r, "🔄", f"업데이트 가능"))
+                self.check_results[repo] = {"status": "update-available", "local": local_commit, "remote": remote_commit, "behind": behind}
+                self.root.after(0, lambda r=repo, b=behind: self._update_tree_item(r, "🔄", f"업데이트 가능({b}커밋)"))
 
         self.root.after(0, lambda: self.append_log(
             f"\n✅ 선택 업데이트 확인 완료: {update_count}개 업데이트 가능 | ❌ {error_count}개 오류\n\n",
@@ -978,15 +1003,44 @@ class GitSyncGUI:
                 self.root.after(0, lambda: self.set_running(False))
             return
         
-        # 4. 최신 버전 체크
-        if local_commit == remote_commit:
+        # 4. behind/ahead 확인
+        behind, ahead = get_behind_ahead_count(local_path, branch)
+        
+        if behind == 0 and ahead == 0:
             self.root.after(0, lambda: self.append_log(f"  ✅ 이미 최신 버전입니다\n"))
             self.root.after(0, lambda: self.append_log(f"  커밋: {local_commit[:7]}\n\n"))
             if manage_running:
                 self.root.after(0, lambda: self.set_running(False))
             return
         
-        # 5. 업데이트 실행
+        if behind == 0 and ahead > 0:
+            # 로컬이 앞서있음 (원격 force push?) - 강제 리셋 필요
+            self.root.after(0, lambda: self.append_log(f"  ⚠️ 로컬이 {ahead}커밋 앞서있음 (원격 force push?). 강제 리셋 시도...\n", "warning"))
+            # 백업 후 강제 리셋
+            ok_backup, backup_result = self._backup_local_folder(local_path)
+            if ok_backup and backup_result != "(폴더 없음)":
+                self.root.after(0, lambda b=backup_result: self.append_log(f"  📦 로컬 백업: {b}\n", "info"))
+            ok_reset, out_reset = self._hard_reset_to_remote(local_path, branch)
+            if not ok_reset:
+                self.root.after(0, lambda o=out_reset: self.append_log(f"  ❌ 강제 리셋 실패: {o}\n", "error"))
+                if manage_running:
+                    self.root.after(0, lambda: self.set_running(False))
+                return
+            new_commit = get_local_commit(local_path)
+            if new_commit:
+                repos_data = load_repos()
+                for s in repos_data.get("subscriptions", []):
+                    if s.get("repo") == repo:
+                        s["last_commit"] = new_commit
+                        break
+                save_repos(repos_data)
+            self.root.after(0, lambda: self.append_log(f"  ✅ 강제 리셋 완료: {local_commit[:7]} → {remote_commit[:7]}\n\n", "success"))
+            self.root.after(0, lambda: self.tree.set(repo, "update_info", f"✅ 리셋 {remote_commit[:7]}"))
+            if manage_running:
+                self.root.after(0, lambda: self.set_running(False))
+            return
+        
+        # 5. 업데이트 실행 (behind > 0)
         self.root.after(0, lambda: self.append_log(f"  🔄 업데이트 필요: {local_commit[:7]} → {remote_commit[:7]}\n"))
         self.root.after(0, lambda: self.append_log(f"  ⬇️ 업데이트 중...\n"))
 
