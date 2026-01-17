@@ -162,6 +162,41 @@ def is_merge_conflict_error(git_output: str) -> bool:
     )
 
 
+def is_local_changes_error(git_output: str) -> bool:
+    """git 출력이 로컬 변경사항으로 인한 실패인지 여부"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "local changes" in text and "overwritten" in text
+        or "please commit your changes or stash them" in text
+        or "your local changes to the following files would be overwritten" in text
+    )
+
+
+def discard_local_changes(repo_path: str) -> tuple[bool, str]:
+    """로컬 변경사항을 모두 폐기 (reset --hard + clean -fd)"""
+    ok1, out1 = run_git(["reset", "--hard", "HEAD"], repo_path)
+    ok2, out2 = run_git(["clean", "-fd"], repo_path)
+    if ok1 and ok2:
+        return True, "local changes discarded"
+    return False, f"{out1}\n{out2}"
+
+
+def is_filename_too_long_error(git_output: str) -> bool:
+    """git 출력이 파일명 길이 제한 오류인지 여부 (Windows 260자 제한)"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return "filename too long" in text
+
+
+def enable_longpaths(repo_path: str) -> bool:
+    """Windows 긴 경로 지원 활성화 (core.longpaths)"""
+    ok, _ = run_git(["config", "core.longpaths", "true"], repo_path)
+    return ok
+
+
 def has_unmerged_paths(repo_path: str) -> bool:
     """현재 작업 트리에 미병합 경로가 있는지(머지 진행/충돌 상태) 빠르게 확인"""
     success, output = run_git(["status", "--porcelain"], repo_path)
@@ -383,6 +418,29 @@ def sync_repository(sub: dict, token: str) -> dict:
     success, output = pull_with_token(repo, local_path, branch, token)
 
     if not success:
+        # Filename too long 오류: core.longpaths 설정 후 재시도
+        if is_filename_too_long_error(output):
+            print(f"\n  ⚠️ Filename too long 오류 발생. core.longpaths 설정 후 재시도...")
+            enable_longpaths(local_path)
+            success, output = pull_with_token(repo, local_path, branch, token)
+            if success:
+                new_commit = get_local_commit(local_path)
+                if new_commit:
+                    update_last_commit(owner, repo_name, new_commit)
+                return {"status": "updated", "message": f"{local_commit[:7]} → {remote_commit[:7]} (longpaths 활성화)"}
+        
+        # 로컬 변경사항으로 인한 오류: 변경사항 폐기 후 재시도
+        if is_local_changes_error(output):
+            print(f"\n  ⚠️ 로컬 변경사항 충돌. 변경사항 폐기 후 재시도...")
+            ok_discard, _ = discard_local_changes(local_path)
+            if ok_discard:
+                success, output = pull_with_token(repo, local_path, branch, token)
+                if success:
+                    new_commit = get_local_commit(local_path)
+                    if new_commit:
+                        update_last_commit(owner, repo_name, new_commit)
+                    return {"status": "updated", "message": f"{local_commit[:7]} → {remote_commit[:7]} (로컬변경 폐기)"}
+        
         # GUI와 동일하게: 충돌이면 무인 자동 복구로 최신까지 맞추기
         if is_merge_conflict_error(output) or has_unmerged_paths(local_path):
             ok2, out2 = auto_recover_and_pull(repo, local_path, branch, token)
@@ -430,6 +488,7 @@ def sync_all():
     up_to_date = 0
     errors = 0
     missing = 0
+    error_repos = []  # 오류 발생 저장소 목록
     
     for i, sub in enumerate(subscriptions, 1):
         repo = sub.get("repo", "알 수 없음")
@@ -448,9 +507,11 @@ def sync_all():
         elif status == "missing":
             print(f"⚠️ {message}")
             missing += 1
+            error_repos.append((repo, message))
         else:
             print(f"❌ 오류: {message}")
             errors += 1
+            error_repos.append((repo, message))
     
     # 결과 요약
     print(f"\n{'='*60}")
@@ -462,7 +523,21 @@ def sync_all():
         print(f"  ⚠️ 폴더 없음: {missing}개")
     if errors > 0:
         print(f"  ❌ 오류: {errors}개")
-    print()
+    
+    # 오류 발생 저장소 강조 표시
+    if error_repos:
+        print(f"\n{'!'*60}")
+        print(f" ❌ 오류 발생 저장소 목록 ({len(error_repos)}개)")
+        print(f"{'!'*60}")
+        for repo, msg in error_repos:
+            # 메시지가 길면 요약
+            if len(msg) > 80:
+                msg = msg[:77] + "..."
+            print(f"  ❌ {repo}")
+            print(f"     └─ {msg}")
+        print()
+    else:
+        print()
 
 
 def list_subscriptions():

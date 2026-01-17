@@ -89,6 +89,41 @@ def is_merge_conflict_error(git_output: str) -> bool:
     )
 
 
+def is_local_changes_error(git_output: str) -> bool:
+    """git 출력이 로컬 변경사항으로 인한 실패인지 여부"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "local changes" in text and "overwritten" in text
+        or "please commit your changes or stash them" in text
+        or "your local changes to the following files would be overwritten" in text
+    )
+
+
+def discard_local_changes(repo_path: str) -> tuple[bool, str]:
+    """로컬 변경사항을 모두 폐기 (reset --hard + clean -fd)"""
+    ok1, out1 = run_git(["reset", "--hard", "HEAD"], repo_path)
+    ok2, out2 = run_git(["clean", "-fd"], repo_path)
+    if ok1 and ok2:
+        return True, "local changes discarded"
+    return False, f"{out1}\n{out2}"
+
+
+def is_filename_too_long_error(git_output: str) -> bool:
+    """git 출력이 파일명 길이 제한 오류인지 여부 (Windows 260자 제한)"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return "filename too long" in text
+
+
+def enable_longpaths(repo_path: str) -> bool:
+    """Windows 긴 경로 지원 활성화 (core.longpaths)"""
+    ok, _ = run_git(["config", "core.longpaths", "true"], repo_path)
+    return ok
+
+
 def has_unmerged_paths(repo_path: str) -> bool:
     """현재 작업 트리에 미병합 경로가 있는지(머지 진행/충돌 상태) 빠르게 확인"""
     success, output = run_git(["status", "--porcelain"], repo_path)
@@ -1063,6 +1098,51 @@ class GitSyncGUI:
             # 트리뷰 업데이트
             self.root.after(0, lambda: self.tree.set(repo, "update_info", f"✅ {local_commit[:7]} → {remote_commit[:7]}"))
         else:
+            # Filename too long 오류: core.longpaths 설정 후 재시도
+            if is_filename_too_long_error(output):
+                self.root.after(0, lambda: self.append_log("  ⚠️ Filename too long 오류. core.longpaths 설정 후 재시도...\n", "warning"))
+                enable_longpaths(local_path)
+                success2, output2 = self._pull_with_token(repo, local_path, branch, token)
+                if success2:
+                    new_commit = get_local_commit(local_path)
+                    if new_commit:
+                        repos_data = load_repos()
+                        for s in repos_data.get("subscriptions", []):
+                            if s.get("repo") == repo:
+                                s["last_commit"] = new_commit
+                                break
+                        save_repos(repos_data)
+                    self.root.after(0, lambda: self.append_log("  ✅ 업데이트 완료! (longpaths 활성화)\n\n", "success"))
+                    self.root.after(0, lambda: self.tree.set(repo, "update_info", f"✅ {local_commit[:7]} → {remote_commit[:7]}"))
+                    if manage_running:
+                        self.root.after(0, lambda: self.set_running(False))
+                    return
+                else:
+                    output = output2  # 재시도 후에도 실패한 출력으로 계속 처리
+            
+            # 로컬 변경사항으로 인한 오류: 변경사항 폐기 후 재시도
+            if is_local_changes_error(output):
+                self.root.after(0, lambda: self.append_log("  ⚠️ 로컬 변경사항 충돌. 변경사항 폐기 후 재시도...\n", "warning"))
+                ok_discard, _ = discard_local_changes(local_path)
+                if ok_discard:
+                    success3, output3 = self._pull_with_token(repo, local_path, branch, token)
+                    if success3:
+                        new_commit = get_local_commit(local_path)
+                        if new_commit:
+                            repos_data = load_repos()
+                            for s in repos_data.get("subscriptions", []):
+                                if s.get("repo") == repo:
+                                    s["last_commit"] = new_commit
+                                    break
+                            save_repos(repos_data)
+                        self.root.after(0, lambda: self.append_log("  ✅ 업데이트 완료! (로컬변경 폐기)\n\n", "success"))
+                        self.root.after(0, lambda: self.tree.set(repo, "update_info", f"✅ {local_commit[:7]} → {remote_commit[:7]}"))
+                        if manage_running:
+                            self.root.after(0, lambda: self.set_running(False))
+                        return
+                    else:
+                        output = output3
+            
             if is_merge_conflict_error(output) or has_unmerged_paths(local_path):
                 self.root.after(0, lambda: self.append_log("  ❌ 업데이트 실패: 머지 충돌(미병합 파일)이 있습니다.\n", "error"))
                 ok2, out2 = self._auto_recover_and_pull(repo, local_path, branch, token)
