@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,9 @@ SCRIPT_DIR = Path(__file__).parent
 ENV_FILE = SCRIPT_DIR / ".env"
 DATA_DIR = SCRIPT_DIR / "data"
 REPOS_FILE = DATA_DIR / "repos.json"
+
+MAX_RETRY_ROUNDS = 3  # HTTP 500 재시도 최대 횟수
+RETRY_WAIT_SECONDS = 300  # 재시도 대기 시간 (5분)
 
 
 def load_config() -> dict:
@@ -181,6 +185,18 @@ def discard_local_changes(repo_path: str) -> tuple[bool, str]:
     if ok1 and ok2:
         return True, "local changes discarded"
     return False, f"{out1}\n{out2}"
+
+
+def is_http_500_error(git_output: str) -> bool:
+    """git 출력이 HTTP 500 서버 오류인지 여부 (GitHub 간헐적 장애)"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "returned error: 500" in text
+        or "http 500" in text
+        or ("internal server error" in text and "unable to access" in text)
+    )
 
 
 def is_filename_too_long_error(git_output: str) -> bool:
@@ -381,8 +397,10 @@ def sync_repository(sub: dict, token: str) -> dict:
     
     # fetch로 원격 정보 가져오기
     success, output = fetch_with_token(repo, local_path, token)
-    
+
     if not success:
+        if is_http_500_error(output):
+            return {"status": "error", "message": f"fetch 실패: {output}", "retryable": True}
         return {"status": "error", "message": f"fetch 실패: {output}"}
     
     # 로컬과 원격 커밋 비교
@@ -452,6 +470,8 @@ def sync_repository(sub: dict, token: str) -> dict:
                 update_last_commit(owner, repo_name, new_commit)
             return {"status": "updated", "message": "자동 복구 후 업데이트 완료"}
 
+        if is_http_500_error(output):
+            return {"status": "error", "message": f"pull 실패: {output}", "retryable": True}
         return {"status": "error", "message": f"pull 실패: {output}"}
     
     # 새 커밋 SHA 저장
@@ -484,20 +504,21 @@ def sync_all():
     print("  (gitsync.py는 실행 시 모든 항목을 자동 업데이트합니다: auto_update 플래그 무시)")
     print()
     
-    updated = 0
-    up_to_date = 0
-    errors = 0
-    missing = 0
-    error_repos = []  # 오류 발생 저장소 목록
-    
+    updated = 0  # 업데이트 완료 수
+    up_to_date = 0  # 이미 최신 수
+    errors = 0  # 오류 수
+    missing = 0  # 폴더 없음 수
+    error_repos: list[tuple[str, str]] = []  # 오류 발생 저장소 목록 (repo, message)
+    retry_queue: list[dict] = []  # HTTP 500 재시도 대기 목록
+
     for i, sub in enumerate(subscriptions, 1):
         repo = sub.get("repo", "알 수 없음")
         print(f"[{i}/{len(subscriptions)}] {repo}...", end=" ", flush=True)
-        
+
         result = sync_repository(sub, token)
         status = result["status"]
         message = result["message"]
-        
+
         if status == "updated":
             print(f"✅ 업데이트됨 ({message})")
             updated += 1
@@ -508,11 +529,56 @@ def sync_all():
             print(f"⚠️ {message}")
             missing += 1
             error_repos.append((repo, message))
+        elif result.get("retryable"):
+            print(f"🔄 HTTP 500 - 나중에 재시도 예정")
+            retry_queue.append(sub)
         else:
             print(f"❌ 오류: {message}")
             errors += 1
             error_repos.append((repo, message))
-    
+
+    # HTTP 500 재시도 루프
+    retry_round = 0  # 현재 재시도 라운드
+    while retry_queue and retry_round < MAX_RETRY_ROUNDS:
+        retry_round += 1
+        wait_minutes = RETRY_WAIT_SECONDS // 60  # 대기 시간(분)
+        print(f"\n{'~'*60}")
+        print(f" 🔄 HTTP 500 재시도 대기 ({len(retry_queue)}개, {retry_round}/{MAX_RETRY_ROUNDS}라운드)")
+        print(f"    {wait_minutes}분 후 재시도합니다...")
+        print(f"{'~'*60}")
+        time.sleep(RETRY_WAIT_SECONDS)
+
+        still_failing: list[dict] = []  # 이번 라운드에서도 실패한 목록
+        for i, sub in enumerate(retry_queue, 1):
+            repo = sub.get("repo", "알 수 없음")
+            print(f"[재시도 {retry_round}-{i}/{len(retry_queue)}] {repo}...", end=" ", flush=True)
+
+            result = sync_repository(sub, token)
+            status = result["status"]
+            message = result["message"]
+
+            if status == "updated":
+                print(f"✅ 업데이트됨 ({message})")
+                updated += 1
+            elif status == "up-to-date":
+                print(f"⬜ 최신 상태")
+                up_to_date += 1
+            elif result.get("retryable"):
+                print(f"🔄 여전히 HTTP 500")
+                still_failing.append(sub)
+            else:
+                print(f"❌ 오류: {message}")
+                errors += 1
+                error_repos.append((repo, message))
+
+        retry_queue = still_failing
+
+    # 재시도 소진 후에도 남은 500 에러를 최종 오류로 집계
+    for sub in retry_queue:
+        repo = sub.get("repo", "알 수 없음")
+        errors += 1
+        error_repos.append((repo, f"HTTP 500 - {MAX_RETRY_ROUNDS}회 재시도 후에도 실패"))
+
     # 결과 요약
     print(f"\n{'='*60}")
     print(f" 동기화 완료")
@@ -523,7 +589,7 @@ def sync_all():
         print(f"  ⚠️ 폴더 없음: {missing}개")
     if errors > 0:
         print(f"  ❌ 오류: {errors}개")
-    
+
     # 오류 발생 저장소 강조 표시
     if error_repos:
         print(f"\n{'!'*60}")
