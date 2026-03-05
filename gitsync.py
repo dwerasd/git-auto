@@ -199,6 +199,36 @@ def is_http_500_error(git_output: str) -> bool:
     )
 
 
+def is_network_error(git_output: str) -> bool:
+    """git 출력이 네트워크 연결 오류인지 여부 (타임아웃, DNS 실패 등 일시적 장애)"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "could not connect to server" in text
+        or "connection timed out" in text
+        or "connection refused" in text
+        or "network is unreachable" in text
+        or "name or service not known" in text  # DNS 실패
+        or "couldn't resolve host" in text  # DNS 실패
+        or ("failed to connect" in text and "after" in text and "ms" in text)
+    )
+
+
+def is_repo_gone_error(git_output: str) -> bool:
+    """git 출력이 저장소 삭제/비공개 전환 등으로 접근 불가인지 여부 (404/403)"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "repository not found" in text
+        or "returned error: 404" in text
+        or "returned error: 403" in text
+        or ("could not read from remote repository" in text
+            and "repository not found" in text)
+    )
+
+
 def is_filename_too_long_error(git_output: str) -> bool:
     """git 출력이 파일명 길이 제한 오류인지 여부 (Windows 260자 제한)"""
     if not git_output:
@@ -235,6 +265,37 @@ def get_remote_commit(repo_path: str, branch: str = "main") -> str | None:
     """원격 저장소의 최신 커밋 SHA (fetch 후)"""
     success, output = run_git(["rev-parse", f"origin/{branch}"], repo_path)
     return output if success else None
+
+
+# 원격 커밋 수가 로컬의 이 비율 이하로 줄면 데이터 초기화로 판단
+RESET_DETECTION_RATIO = 0.3  # 30% 이하
+# 절대 기준: 로컬 커밋이 이 수 이상이면서 원격이 이 수 이하면 초기화로 판단
+RESET_LOCAL_MIN_COMMITS = 50  # 로컬 최소 커밋 수
+RESET_REMOTE_MAX_COMMITS = 5  # 원격 최대 커밋 수 (초기화 의심)
+
+
+def get_commit_count(repo_path: str, ref: str = "HEAD") -> int:
+    """특정 ref의 총 커밋 수 반환"""
+    success, output = run_git(["rev-list", "--count", ref], repo_path)
+    return int(output) if success and output.isdigit() else -1
+
+
+def is_data_reset_suspected(local_count: int, remote_count: int) -> bool:
+    """원격 저장소가 데이터 초기화(히스토리 삭제)된 것으로 의심되는지 판단
+
+    기준:
+      1) 원격 커밋이 로컬의 30% 이하로 급감
+      2) 또는 로컬 50+ 커밋인데 원격이 5 이하
+    """
+    if local_count <= 0 or remote_count <= 0:
+        return False
+    # 비율 기준
+    if remote_count < local_count * RESET_DETECTION_RATIO:
+        return True
+    # 절대 기준
+    if local_count >= RESET_LOCAL_MIN_COMMITS and remote_count <= RESET_REMOTE_MAX_COMMITS:
+        return True
+    return False
 
 
 def get_behind_ahead_count(repo_path: str, branch: str) -> tuple[int, int]:
@@ -399,7 +460,9 @@ def sync_repository(sub: dict, token: str) -> dict:
     success, output = fetch_with_token(repo, local_path, token)
 
     if not success:
-        if is_http_500_error(output):
+        if is_repo_gone_error(output):
+            return {"status": "gone", "message": f"저장소 삭제/비공개 전환: {output}"}
+        if is_http_500_error(output) or is_network_error(output):
             return {"status": "error", "message": f"fetch 실패: {output}", "retryable": True}
         return {"status": "error", "message": f"fetch 실패: {output}"}
     
@@ -418,7 +481,20 @@ def sync_repository(sub: dict, token: str) -> dict:
         return {"status": "up-to-date", "message": "최신 상태"}
     
     if behind == 0 and ahead > 0:
-        # 로컬이 앞선 있음 (원격에서 force push 됐을 수 있음) - 강제 리셋 필요
+        # 로컬이 앞선 있음 (원격에서 force push 됐을 수 있음)
+        # 데이터 초기화 감지: 원격 커밋 수가 급감했으면 리셋 거부
+        local_count = get_commit_count(local_path, "HEAD")  # 로컬 총 커밋 수
+        remote_count = get_commit_count(local_path, f"origin/{branch}")  # 원격 총 커밋 수
+        if is_data_reset_suspected(local_count, remote_count):
+            print(f"  🛑 데이터 초기화 의심! 로컬 {local_count}커밋 → 원격 {remote_count}커밋")
+            ok_backup, backup_result = backup_local_folder(local_path)
+            if ok_backup and backup_result != "(폴더 없음)":
+                print(f"  📦 로컬 백업: {backup_result}")
+            return {
+                "status": "warning",
+                "message": f"데이터 초기화 의심 (로컬 {local_count} → 원격 {remote_count}커밋). 리셋 거부, 백업만 수행"
+            }
+
         print(f"  ⚠️ 로컬이 {ahead}커밋 앞서있음 (원격 force push?). 강제 리셋 시도...")
         # 백업 후 강제 리셋
         ok_backup, backup_result = backup_local_folder(local_path)
@@ -508,8 +584,11 @@ def sync_all():
     up_to_date = 0  # 이미 최신 수
     errors = 0  # 오류 수
     missing = 0  # 폴더 없음 수
+    gone = 0  # 저장소 삭제/비공개 수
+    warnings = 0  # 데이터 초기화 의심 수
     error_repos: list[tuple[str, str]] = []  # 오류 발생 저장소 목록 (repo, message)
-    retry_queue: list[dict] = []  # HTTP 500 재시도 대기 목록
+    warning_repos: list[tuple[str, str]] = []  # 경고 저장소 목록 (repo, message)
+    retry_queue: list[dict] = []  # HTTP 500/네트워크 재시도 대기 목록
 
     for i, sub in enumerate(subscriptions, 1):
         repo = sub.get("repo", "알 수 없음")
@@ -525,12 +604,20 @@ def sync_all():
         elif status == "up-to-date":
             print(f"⬜ 최신 상태")
             up_to_date += 1
+        elif status == "gone":
+            print(f"🚫 {message}")
+            gone += 1
+            error_repos.append((repo, message))
+        elif status == "warning":
+            print(f"🛑 {message}")
+            warnings += 1
+            warning_repos.append((repo, message))
         elif status == "missing":
             print(f"⚠️ {message}")
             missing += 1
             error_repos.append((repo, message))
         elif result.get("retryable"):
-            print(f"🔄 HTTP 500 - 나중에 재시도 예정")
+            print(f"🔄 서버/네트워크 오류 - 나중에 재시도 예정")
             retry_queue.append(sub)
         else:
             print(f"❌ 오류: {message}")
@@ -543,7 +630,7 @@ def sync_all():
         retry_round += 1
         wait_minutes = RETRY_WAIT_SECONDS // 60  # 대기 시간(분)
         print(f"\n{'~'*60}")
-        print(f" 🔄 HTTP 500 재시도 대기 ({len(retry_queue)}개, {retry_round}/{MAX_RETRY_ROUNDS}라운드)")
+        print(f" 🔄 서버/네트워크 오류 재시도 대기 ({len(retry_queue)}개, {retry_round}/{MAX_RETRY_ROUNDS}라운드)")
         print(f"    {wait_minutes}분 후 재시도합니다...")
         print(f"{'~'*60}")
         time.sleep(RETRY_WAIT_SECONDS)
@@ -563,8 +650,16 @@ def sync_all():
             elif status == "up-to-date":
                 print(f"⬜ 최신 상태")
                 up_to_date += 1
+            elif status == "gone":
+                print(f"🚫 {message}")
+                gone += 1
+                error_repos.append((repo, message))
+            elif status == "warning":
+                print(f"🛑 {message}")
+                warnings += 1
+                warning_repos.append((repo, message))
             elif result.get("retryable"):
-                print(f"🔄 여전히 HTTP 500")
+                print(f"🔄 여전히 서버/네트워크 오류")
                 still_failing.append(sub)
             else:
                 print(f"❌ 오류: {message}")
@@ -577,7 +672,7 @@ def sync_all():
     for sub in retry_queue:
         repo = sub.get("repo", "알 수 없음")
         errors += 1
-        error_repos.append((repo, f"HTTP 500 - {MAX_RETRY_ROUNDS}회 재시도 후에도 실패"))
+        error_repos.append((repo, f"서버/네트워크 오류 - {MAX_RETRY_ROUNDS}회 재시도 후에도 실패"))
 
     # 결과 요약
     print(f"\n{'='*60}")
@@ -585,10 +680,28 @@ def sync_all():
     print(f"{'='*60}")
     print(f"  ✅ 업데이트됨: {updated}개")
     print(f"  ⬜ 최신 상태: {up_to_date}개")
+    if gone > 0:
+        print(f"  🚫 저장소 삭제/비공개: {gone}개")
+    if warnings > 0:
+        print(f"  🛑 데이터 초기화 의심: {warnings}개")
     if missing > 0:
         print(f"  ⚠️ 폴더 없음: {missing}개")
     if errors > 0:
         print(f"  ❌ 오류: {errors}개")
+
+    # 데이터 초기화 의심 저장소 강조 표시
+    if warning_repos:
+        print(f"\n{'!'*60}")
+        print(f" 🛑 데이터 초기화 의심 저장소 ({len(warning_repos)}개)")
+        print(f"{'!'*60}")
+        print(f"  ※ 리셋을 거부하고 로컬 백업만 수행했습니다.")
+        print(f"  ※ 원격 저장소를 직접 확인 후 수동 조치하세요.")
+        for repo, msg in warning_repos:
+            if len(msg) > 80:
+                msg = msg[:77] + "..."
+            print(f"  🛑 {repo}")
+            print(f"     └─ {msg}")
+        print()
 
     # 오류 발생 저장소 강조 표시
     if error_repos:

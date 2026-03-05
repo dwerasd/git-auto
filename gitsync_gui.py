@@ -118,6 +118,36 @@ def is_filename_too_long_error(git_output: str) -> bool:
     return "filename too long" in text
 
 
+def is_network_error(git_output: str) -> bool:
+    """git 출력이 네트워크 연결 오류인지 여부 (타임아웃, DNS 실패 등 일시적 장애)"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "could not connect to server" in text
+        or "connection timed out" in text
+        or "connection refused" in text
+        or "network is unreachable" in text
+        or "name or service not known" in text
+        or "couldn't resolve host" in text
+        or ("failed to connect" in text and "after" in text and "ms" in text)
+    )
+
+
+def is_repo_gone_error(git_output: str) -> bool:
+    """git 출력이 저장소 삭제/비공개 전환 등으로 접근 불가인지 여부 (404/403)"""
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "repository not found" in text
+        or "returned error: 404" in text
+        or "returned error: 403" in text
+        or ("could not read from remote repository" in text
+            and "repository not found" in text)
+    )
+
+
 def enable_longpaths(repo_path: str) -> bool:
     """Windows 긴 경로 지원 활성화 (core.longpaths)"""
     ok, _ = run_git(["config", "core.longpaths", "true"], repo_path)
@@ -163,6 +193,34 @@ def get_behind_ahead_count(repo_path: str, branch: str) -> tuple[int, int]:
     ahead = int(out2) if ok2 and out2.isdigit() else 0
     
     return behind, ahead
+
+
+# 원격 커밋 수가 로컬의 이 비율 이하로 줄면 데이터 초기화로 판단
+RESET_DETECTION_RATIO = 0.3  # 30% 이하
+RESET_LOCAL_MIN_COMMITS = 50  # 로컬 최소 커밋 수
+RESET_REMOTE_MAX_COMMITS = 5  # 원격 최대 커밋 수 (초기화 의심)
+
+
+def get_commit_count(repo_path: str, ref: str = "HEAD") -> int:
+    """특정 ref의 총 커밋 수 반환"""
+    success, output = run_git(["rev-list", "--count", ref], repo_path)
+    return int(output) if success and output.isdigit() else -1
+
+
+def is_data_reset_suspected(local_count: int, remote_count: int) -> bool:
+    """원격 저장소가 데이터 초기화(히스토리 삭제)된 것으로 의심되는지 판단
+
+    기준:
+      1) 원격 커밋이 로컬의 30% 이하로 급감
+      2) 또는 로컬 50+ 커밋인데 원격이 5 이하
+    """
+    if local_count <= 0 or remote_count <= 0:
+        return False
+    if remote_count < local_count * RESET_DETECTION_RATIO:
+        return True
+    if local_count >= RESET_LOCAL_MIN_COMMITS and remote_count <= RESET_REMOTE_MAX_COMMITS:
+        return True
+    return False
 
 
 class GitSyncGUI:
@@ -939,9 +997,18 @@ class GitSyncGUI:
 
             if not success:
                 error_count += 1
-                self.check_results[repo] = {"status": "fetch-failed", "message": output}
-                self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "fetch 실패", True))
-                self.root.after(0, lambda r=repo, o=output: self.append_log(f"  ❌ {r}: fetch 실패: {o}\n", "error"))
+                if is_repo_gone_error(output):
+                    self.check_results[repo] = {"status": "gone", "message": output}
+                    self.root.after(0, lambda r=repo: self._update_tree_item(r, "🚫", "저장소 삭제/비공개", True))
+                    self.root.after(0, lambda r=repo: self.append_log(f"  🚫 {r}: 저장소 삭제/비공개 전환됨\n", "error"))
+                elif is_network_error(output):
+                    self.check_results[repo] = {"status": "network-error", "message": output}
+                    self.root.after(0, lambda r=repo: self._update_tree_item(r, "🔄", "네트워크 오류", True))
+                    self.root.after(0, lambda r=repo: self.append_log(f"  🔄 {r}: 네트워크 오류 (일시적)\n", "warning"))
+                else:
+                    self.check_results[repo] = {"status": "fetch-failed", "message": output}
+                    self.root.after(0, lambda r=repo: self._update_tree_item(r, "⚠️", "fetch 실패", True))
+                    self.root.after(0, lambda r=repo, o=output: self.append_log(f"  ❌ {r}: fetch 실패: {o}\n", "error"))
                 continue
 
             # commit 비교
@@ -961,10 +1028,21 @@ class GitSyncGUI:
                 self.check_results[repo] = {"status": "up-to-date", "local": local_commit, "remote": remote_commit}
                 self.root.after(0, lambda r=repo, c=local_commit: self._update_tree_item(r, "✅", f"최신({c[:7]})"))
             elif behind == 0 and ahead > 0:
-                # 로컬이 앞서있음 (원격 force push?) - 강제 리셋 필요
-                update_count += 1
-                self.check_results[repo] = {"status": "update-available", "local": local_commit, "remote": remote_commit, "ahead": ahead}
-                self.root.after(0, lambda r=repo, a=ahead: self._update_tree_item(r, "⚠️", f"강제리셋필요(ahead {a})"))
+                # 로컬이 앞서있음 — 데이터 초기화 여부 확인
+                local_count = get_commit_count(local_path, "HEAD")
+                remote_count = get_commit_count(local_path, f"origin/{branch}")
+                if is_data_reset_suspected(local_count, remote_count):
+                    error_count += 1
+                    self.check_results[repo] = {"status": "reset-suspected", "local": local_commit, "remote": remote_commit,
+                                                 "local_count": local_count, "remote_count": remote_count}
+                    self.root.after(0, lambda r=repo, lc=local_count, rc=remote_count:
+                        self._update_tree_item(r, "🛑", f"초기화의심({lc}→{rc})", True))
+                    self.root.after(0, lambda r=repo, lc=local_count, rc=remote_count:
+                        self.append_log(f"  🛑 {r}: 데이터 초기화 의심 (로컬 {lc} → 원격 {rc}커밋)\n", "error"))
+                else:
+                    update_count += 1
+                    self.check_results[repo] = {"status": "update-available", "local": local_commit, "remote": remote_commit, "ahead": ahead}
+                    self.root.after(0, lambda r=repo, a=ahead: self._update_tree_item(r, "⚠️", f"강제리셋필요(ahead {a})"))
             else:
                 update_count += 1
                 self.check_results[repo] = {"status": "update-available", "local": local_commit, "remote": remote_commit, "behind": behind}
@@ -1023,11 +1101,16 @@ class GitSyncGUI:
             run_git(["remote", "set-url", "origin", clean_url], local_path)
         
         if not success:
-            self.root.after(0, lambda: self.append_log(f"  ❌ fetch 실패: {output}\n"))
+            if is_repo_gone_error(output):
+                self.root.after(0, lambda: self.append_log(f"  🚫 저장소 삭제/비공개 전환됨\n", "error"))
+            elif is_network_error(output):
+                self.root.after(0, lambda: self.append_log(f"  🔄 네트워크 오류 (일시적): {output}\n", "warning"))
+            else:
+                self.root.after(0, lambda: self.append_log(f"  ❌ fetch 실패: {output}\n"))
             if manage_running:
                 self.root.after(0, lambda: self.set_running(False))
             return
-        
+
         # 3. 커밋 비교
         local_commit = get_local_commit(local_path)
         remote_commit = get_remote_commit(local_path, branch)
@@ -1049,7 +1132,20 @@ class GitSyncGUI:
             return
         
         if behind == 0 and ahead > 0:
-            # 로컬이 앞서있음 (원격 force push?) - 강제 리셋 필요
+            # 로컬이 앞서있음 (원격 force push?) - 데이터 초기화 여부 먼저 확인
+            local_count = get_commit_count(local_path, "HEAD")  # 로컬 총 커밋 수
+            remote_count = get_commit_count(local_path, f"origin/{branch}")  # 원격 총 커밋 수
+            if is_data_reset_suspected(local_count, remote_count):
+                self.root.after(0, lambda lc=local_count, rc=remote_count:
+                    self.append_log(f"  🛑 데이터 초기화 의심! 로컬 {lc}커밋 → 원격 {rc}커밋. 리셋 거부\n", "error"))
+                ok_backup, backup_result = self._backup_local_folder(local_path)
+                if ok_backup and backup_result != "(폴더 없음)":
+                    self.root.after(0, lambda b=backup_result: self.append_log(f"  📦 로컬 백업: {b}\n", "info"))
+                self.root.after(0, lambda: self.tree.set(repo, "update_info", "🛑 초기화 의심"))
+                if manage_running:
+                    self.root.after(0, lambda: self.set_running(False))
+                return
+
             self.root.after(0, lambda: self.append_log(f"  ⚠️ 로컬이 {ahead}커밋 앞서있음 (원격 force push?). 강제 리셋 시도...\n", "warning"))
             # 백업 후 강제 리셋
             ok_backup, backup_result = self._backup_local_folder(local_path)
