@@ -237,6 +237,25 @@ def is_filename_too_long_error(git_output: str) -> bool:
     return "filename too long" in text
 
 
+def is_ref_conflict_error(git_output: str) -> bool:
+    """git 출력이 원격 추적 ref D/F(디렉토리/파일) 충돌인지 여부
+
+    원격에서 'copilot' 브랜치가 삭제되고 'copilot/xxx' 하위 브랜치가
+    생기면, 로컬 stale 추적 ref(refs/remotes/origin/copilot, 파일)가
+    refs/remotes/origin/copilot/xxx(디렉토리) 생성을 차단해 발생.
+    충돌 ref를 직접 삭제(resolve_ref_conflict_and_fetch)하면 해소됨.
+    """
+    if not git_output:
+        return False
+    text = git_output.lower()
+    return (
+        "some local refs could not be updated" in text
+        or "exists; cannot create" in text  # D/F 충돌 직접 증거
+        or "unable to update local ref" in text
+        or "git remote prune" in text  # git 권장 메시지
+    )
+
+
 def enable_longpaths(repo_path: str) -> bool:
     """Windows 긴 경로 지원 활성화 (core.longpaths)"""
     ok, _ = run_git(["config", "core.longpaths", "true"], repo_path)
@@ -339,12 +358,26 @@ def _restore_remote_url(repo_full: str, repo_path: str, token: str) -> None:
         pass
 
 
+def scrub_secrets(text: str) -> str:
+    """git 출력에서 자격증명(토큰) 마스킹 (콘솔/로그 노출 방지)
+
+    토큰 URL(https://<token>@github.com) 및 알려진 GitHub 토큰 포맷을 제거.
+    에러 분류(is_*_error)/ref 파싱은 토큰·URL에 의존하지 않으므로 영향 없음.
+    """
+    if not text:
+        return text
+    text = re.sub(r"https://[^@/\s]+@", "https://", text)  # URL 임베드 자격증명
+    text = re.sub(r"gh[pousr]_[A-Za-z0-9]{20,}", "***", text)  # ghp_/gho_/ghu_/ghs_/ghr_
+    text = re.sub(r"github_pat_[A-Za-z0-9_]{20,}", "***", text)  # fine-grained PAT
+    return text
+
+
 def pull_with_token(repo_full: str, repo_path: str, branch: str, token: str) -> tuple[bool, str]:
     """토큰 설정/복원까지 포함한 pull 실행"""
     _set_remote_url_with_token(repo_full, repo_path, token)
     success, output = run_git(["pull", "origin", branch], repo_path)
     _restore_remote_url(repo_full, repo_path, token)
-    return success, output
+    return success, scrub_secrets(output)
 
 
 def fetch_with_token(repo_full: str, repo_path: str, token: str) -> tuple[bool, str]:
@@ -352,7 +385,96 @@ def fetch_with_token(repo_full: str, repo_path: str, token: str) -> tuple[bool, 
     _set_remote_url_with_token(repo_full, repo_path, token)
     success, output = run_git(["fetch", "origin"], repo_path)
     _restore_remote_url(repo_full, repo_path, token)
-    return success, output
+    return success, scrub_secrets(output)
+
+
+def clean_stale_ref_locks(repo_path: str) -> int:
+    """중단된 git 프로세스가 남긴 stale ref lock 파일 제거
+
+    gitsync는 repo당 git 명령을 순차·동기 실행하므로 동시 실행 git
+    프로세스가 없음. 따라서 잔존 *.lock / packed-refs.new 는 이전 중단
+    실행의 잔재이며, 'git remote prune'의 ref 삭제를 차단함. 안전하게 제거.
+
+    Returns:
+        제거한 파일 수
+    """
+    git_dir = os.path.join(repo_path, ".git")  # .git 디렉토리 경로
+    if not os.path.isdir(git_dir):
+        return 0
+    removed = 0  # 제거한 lock 파일 수
+    # refs/ 하위의 모든 *.lock (ref별 잠금)
+    refs_dir = os.path.join(git_dir, "refs")
+    for root, _dirs, files in os.walk(refs_dir):
+        for fname in files:
+            if fname.endswith(".lock"):
+                try:
+                    os.remove(os.path.join(root, fname))
+                    removed += 1
+                except OSError:
+                    pass  # 이미 사라졌거나 권한 문제는 무시
+    # packed-refs 재작성 관련 임시/잠금 파일
+    for tmp in ("packed-refs.lock", "packed-refs.new"):
+        path = os.path.join(git_dir, tmp)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def parse_conflicting_refs(git_output: str) -> list[str]:
+    """fetch 출력에서 D/F 충돌을 일으키는 기존 추적 ref 경로 추출
+
+    git 에러 형식:
+      "error: 'refs/remotes/origin/litellm_fix' exists; cannot create
+       'refs/remotes/origin/litellm_fix/xxx'"
+    → 'refs/remotes/origin/litellm_fix' (충돌 당사자 단독 ref) 추출.
+
+    Returns:
+        충돌 ref 경로 목록(중복 제거, 등장 순서 유지)
+    """
+    refs: list[str] = []  # 충돌 ref 경로(순서 유지)
+    for match in re.finditer(r"'(refs/remotes/[^']+)' exists; cannot create", git_output):
+        ref = match.group(1)  # 충돌 단독 ref 경로
+        if ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def resolve_ref_conflict_and_fetch(
+    repo_full: str, repo_path: str, token: str, prev_output: str
+) -> tuple[bool, str]:
+    """D/F ref 충돌을 외과적으로 해소하고 fetch 재시도
+
+    fetch 에러에 명시된 충돌 단독 ref('refs/remotes/origin/x')만
+    'git update-ref -d'로 직접 삭제한 뒤 재fetch. 삭제 후 재fetch 시
+    원격의 'x/yyy' 하위 브랜치가 정상 생성됨(로컬 브랜치/작업물 무영향).
+
+    'git remote prune origin'을 쓰지 않는 이유: prune은 원격에서 사라진
+    모든 stale 추적 ref를 건드리는데, Windows 케이스 비민감 FS에서는
+    대소문자만 다른 ref(예: litellm_Release_notes vs litellm_release_notes)의
+    .lock 생성이 충돌해 prune 전체가 실패하고 정작 D/F 충돌도 못 지움.
+    충돌 당사자만 외과적으로 제거하면 무관한 ref를 건드리지 않아 안전.
+
+    Returns:
+        (success, output): fetch 성공 여부와 삭제+fetch 합산 출력(토큰 스크럽)
+    """
+    conflicting = parse_conflicting_refs(prev_output)  # 충돌 ref 목록
+    if not conflicting:
+        return False, prev_output  # 파싱 불가 → 복구 불가, 원본 오류 반환
+
+    _set_remote_url_with_token(repo_full, repo_path, token)
+    clean_stale_ref_locks(repo_path)  # 중단 잔재 정리 (update-ref 차단 해소)
+    del_logs: list[str] = []  # ref 삭제 결과 로그
+    for ref in conflicting:
+        ok_del, out_del = run_git(["update-ref", "-d", ref], repo_path)  # 충돌 ref 삭제
+        del_logs.append(f"삭제 {ref}: {'ok' if ok_del else out_del}")
+    ok_fetch, out_fetch = run_git(["fetch", "origin"], repo_path)  # 정리 후 재fetch
+    _restore_remote_url(repo_full, repo_path, token)
+    combined = ("\n".join(del_logs) + "\n" + out_fetch).strip()  # 진단용 합산 출력
+    return ok_fetch, scrub_secrets(combined)
 
 
 def abort_merge(repo_path: str) -> tuple[bool, str]:
@@ -458,6 +580,11 @@ def sync_repository(sub: dict, token: str) -> dict:
     
     # fetch로 원격 정보 가져오기
     success, output = fetch_with_token(repo, local_path, token)
+
+    # 원격 추적 ref D/F 충돌: 충돌 ref 직접 삭제 후 재시도
+    if not success and is_ref_conflict_error(output):
+        print(f"\n  ⚠️ 원격 추적 ref 충돌(D/F). 충돌 ref 삭제 후 재시도...")
+        success, output = resolve_ref_conflict_and_fetch(repo, local_path, token, output)
 
     if not success:
         if is_repo_gone_error(output):
