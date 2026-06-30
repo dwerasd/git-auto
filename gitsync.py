@@ -688,6 +688,20 @@ def sync_repository(sub: dict, token: str) -> dict:
     }
 
 
+# 반환값: 없음 (사용자 Enter 입력 또는 비대화형 환경에서 즉시 반환)
+def pause_before_exit() -> None:
+    """오류 종료 시 콘솔(cmd) 창이 즉시 닫히지 않도록 입력을 대기한다.
+
+    더블클릭/배치 실행으로 스크립트가 끝나면 창이 함께 닫혀 오류 목록을
+    읽을 수 없으므로, 호출 측에서 오류가 있을 때만 이 함수로 대기시킨다.
+    stdin이 없는 비대화형(파이프/리다이렉트) 환경에서는 그냥 통과한다.
+    """
+    try:
+        input("\n오류가 발생했습니다. 창을 닫으려면 Enter 키를 누르세요...")
+    except (EOFError, KeyboardInterrupt):
+        pass  # 비대화형이거나 Ctrl+C면 대기 없이 종료
+
+
 def sync_all():
     """모든 구독 저장소 동기화"""
     config = load_config()
@@ -721,7 +735,10 @@ def sync_all():
         repo = sub.get("repo", "알 수 없음")
         print(f"[{i}/{len(subscriptions)}] {repo}...", end=" ", flush=True)
 
-        result = sync_repository(sub, token)
+        try:
+            result = sync_repository(sub, token)
+        except Exception as e:  # 단일 저장소의 예기치 못한 예외가 전체 배치를 중단시키지 않도록 격리
+            result = {"status": "error", "message": f"예외 발생: {scrub_secrets(str(e))}"}
         status = result["status"]
         message = result["message"]
 
@@ -767,7 +784,10 @@ def sync_all():
             repo = sub.get("repo", "알 수 없음")
             print(f"[재시도 {retry_round}-{i}/{len(retry_queue)}] {repo}...", end=" ", flush=True)
 
-            result = sync_repository(sub, token)
+            try:
+                result = sync_repository(sub, token)
+            except Exception as e:  # 단일 저장소의 예기치 못한 예외가 재시도 배치를 중단시키지 않도록 격리
+                result = {"status": "error", "message": f"예외 발생: {scrub_secrets(str(e))}"}
             status = result["status"]
             message = result["message"]
 
@@ -845,6 +865,10 @@ def sync_all():
     else:
         print()
 
+    # 오류/경고가 있으면 콘솔(cmd) 창이 즉시 닫히지 않도록 입력 대기
+    if error_repos or warning_repos:
+        pause_before_exit()
+
 
 def list_subscriptions():
     """구독 목록 출력"""
@@ -910,6 +934,15 @@ def remove_repo(repo_input: str, delete_local: bool = False):
 
 
 def main():
+    # Windows 콘솔(cp949 등)에서도 이모지/한글 출력이 UnicodeEncodeError로
+    # 중단되지 않도록 stdout/stderr를 UTF-8(치환 모드)로 강제. 오류 리스트가
+    # 깨지지 않고 끝까지 출력되도록 보장한다.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass  # 리다이렉트 등으로 재설정 불가한 스트림은 무시
+
     parser = argparse.ArgumentParser(
         description="GitHub 구독 저장소 동기화",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -957,4 +990,24 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        # 오류 종료 코드(0/None 외)면 창을 유지해 메시지를 확인하게 함
+        if e.code not in (0, None):
+            pause_before_exit()
+        raise
+    except KeyboardInterrupt:
+        print("\n사용자에 의해 중단되었습니다.")
+        sys.exit(130)
+    except Exception:  # 예기치 못한 치명적 오류: 진단 출력 후 창 유지
+        import traceback
+        try:  # 출력 자체가 실패해도 창 유지(pause)는 반드시 보장
+            print("\n" + "!" * 60)
+            print(" [오류] 예기치 못한 오류로 중단되었습니다")
+            print("!" * 60)
+            print(scrub_secrets(traceback.format_exc()))
+        except Exception:
+            pass
+        pause_before_exit()
+        sys.exit(1)
